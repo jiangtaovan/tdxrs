@@ -3,6 +3,8 @@
 用法:
     tdxrs quote 600519
     tdxrs bars 600519 --count 30
+    tdxrs v2 quote 600519            # 新一代 7709 协议（2026-07 起旧协议行情断供）
+    tdxrs v2 bars 600519 --count 30
     tdxrs download --market sh
     tdxrs --help
 """
@@ -105,17 +107,21 @@ def make_client(timeout=5.0):
 # 命令实现
 # ============================================================
 
+_STARVED_HINT = (
+    "提示: 2026-07 起服务端对旧协议行情功能族（快照/K线/分时/逐笔）静默断供\n"
+    "（目录/财务/除权类仍存活），市场数据走新协议（本 CLI 默认自动 v2）。"
+)
+
+
 def cmd_quote(args):
     """实时行情"""
+    from tdxrs.v2_client import TdxV2Error
+
     codes = [c.strip() for c in args.code.split(",") if c.strip()]
     if not codes:
         print("error: 请指定至少一个股票代码", file=sys.stderr)
         sys.exit(1)
     check_limit("quote_codes", len(codes))
-
-    client = make_client(args.timeout)
-    pairs = [(auto_market(c), c) for c in codes]
-    results = client.get_security_quotes(pairs)
 
     columns = [
         ("代码", "代码", 8),
@@ -129,33 +135,96 @@ def cmd_quote(args):
     ]
 
     rows = []
-    for r in results:
-        code = r.get("code", "")
-        price = r.get("price", 0)
-        open_ = r.get("open", 0)
-        high = r.get("high", 0)
-        low = r.get("low", 0)
-        vol = r.get("vol", 0)
-        amount = r.get("amount", 0)
-        last_close = r.get("last_close", 0)
-        change_pct = ((price - last_close) / last_close * 100) if last_close else 0
+    try:
+        # v2: 单连接逐只取（快照帧一帧一票）
+        from tdxrs.v2_client import TdxV2Client
 
-        rows.append({
-            "代码": code,
-            "最新": f"{price:.2f}",
-            "涨跌%": f"{change_pct:+.2f}",
-            "开盘": f"{open_:.2f}",
-            "最高": f"{high:.2f}",
-            "最低": f"{low:.2f}",
-            "成交量": f"{vol:,.0f}",
-            "成交额": f"{amount:,.0f}",
-        })
+        with TdxV2Client(_V2_DEFAULT_HOST, timeout=args.timeout) as client:
+            for code in codes:
+                r = client.get_quote(auto_market(code), code)
+                change_pct = (
+                    (r["price"] - r["last_close"]) / r["last_close"] * 100
+                    if r["last_close"] else 0
+                )
+                rows.append({
+                    "代码": code,
+                    "最新": f"{r['price']:.2f}",
+                    "涨跌%": f"{change_pct:+.2f}",
+                    "开盘": f"{r['open']:.2f}",
+                    "最高": f"{r['high']:.2f}",
+                    "最低": f"{r['low']:.2f}",
+                    "成交量": f"{r['vol']:,.0f}",
+                    "成交额": f"{r['amount']:,.0f}",
+                })
+    except (TdxV2Error, OSError) as e:
+        print(f"warn: v2 行情不可用({e})，尝试旧协议…", file=sys.stderr)
+        client = make_client(args.timeout)
+        pairs = [(auto_market(c), c) for c in codes]
+        results = client.get_security_quotes(pairs)
+        for r in results:
+            price = r.get("price", 0)
+            last_close = r.get("last_close", 0)
+            change_pct = ((price - last_close) / last_close * 100) if last_close else 0
+            rows.append({
+                "代码": r.get("code", ""),
+                "最新": f"{price:.2f}",
+                "涨跌%": f"{change_pct:+.2f}",
+                "开盘": f"{r.get('open', 0):.2f}",
+                "最高": f"{r.get('high', 0):.2f}",
+                "最低": f"{r.get('low', 0):.2f}",
+                "成交量": f"{r.get('vol', 0):,.0f}",
+                "成交额": f"{r.get('amount', 0):,.0f}",
+            })
+        if not rows:
+            print("error: 旧协议快照为空（服务端断供）且 v2 不可用。" + _STARVED_HINT,
+                  file=sys.stderr)
+            sys.exit(1)
 
     format_output(rows, columns, args.format)
 
 
+def _fetch_xdxr_old(market, code, timeout):
+    """旧协议取除权记录（目录类接口 2026-09 实测仍存活）。"""
+    try:
+        return make_client(timeout).get_xdxr_info(market, code) or []
+    except Exception:
+        return []
+
+
+def _fetch_bars_v2_with_context(market, code, count, category, timeout, xdxr_list):
+    """v2 取 K 线；若最早除权事件早于窗口，按自动分档补拉历史上下文页。
+
+    返回 (bars, context_bars)，均按日期升序。
+    """
+    from tdxrs import adjust as fq_adjust
+    from tdxrs.v2_client import MAX_BARS_PER_REQUEST, TdxV2Client
+
+    with TdxV2Client(_V2_DEFAULT_HOST, timeout=timeout) as client:
+        bars = client.get_bars(market, code, count=min(count, MAX_BARS_PER_REQUEST),
+                               category=category)
+        context = []
+        events = fq_adjust.collect_events(xdxr_list)
+        if bars and events and bars[0].date > events[0][0]:
+            tier = fq_adjust.auto_tier(xdxr_list, datetime.now().year)
+            page_cap = -(-fq_adjust.TIER_BARS[tier] // MAX_BARS_PER_REQUEST)
+            start = len(bars)
+            for _ in range(page_cap):
+                page = client.get_bars(market, code, count=MAX_BARS_PER_REQUEST,
+                                       category=category, start=start)
+                if not page:
+                    break
+                context = page + context  # 越翻越旧，前置保持升序
+                if page[0].date <= events[0][0]:
+                    break
+                start += len(page)
+    return bars, context
+
+
 def cmd_bars(args):
-    """K线数据"""
+    """K线数据（v2 协议支持全部周期；复权 = v2 原始K线 + 旧协议除权 + 本地调整）"""
+    from tdxrs import adjust as fq_adjust
+    from tdxrs.v2_client import TdxV2Client, TdxV2Error
+
     code = args.code
     market = auto_market(code)
     cat = _CATEGORY_MAP.get(args.category)
@@ -165,12 +234,42 @@ def cmd_bars(args):
 
     count = check_limit("bars_count", args.count)
     fq = _FQ_MAP.get(args.fq, FQ_NONE)
+    intraday = cat in (0, 1, 2, 3)  # 分钟/小时级：日期列附结束时刻
 
-    client = make_client(args.timeout)
-    bars = client.get_security_bars(cat, market, code, 0, count, fq)
+    if fq == FQ_NONE:
+        try:
+            with TdxV2Client(_V2_DEFAULT_HOST, timeout=args.timeout) as client:
+                bars = client.get_bars(market, code, count=min(count, 700), category=cat)
+        except (TdxV2Error, OSError) as e:
+            print(f"warn: v2 K线不可用({e})，尝试旧协议…", file=sys.stderr)
+            client = make_client(args.timeout)
+            bars = client.get_security_bars(cat, market, code, 0, count, fq)
+            if not bars:
+                print("error: 旧协议K线为空（服务端断供）且 v2 不可用。" + _STARVED_HINT,
+                      file=sys.stderr)
+                sys.exit(1)
+    else:
+        xdxr_list = _fetch_xdxr_old(market, code, args.timeout)
+        if not xdxr_list:
+            print(
+                "error: 复权失败——旧协议除权接口无数据且新协议除权接口尚未逆向。\n"
+                "替代方案: `tdxrs bars --fq 0` 取原始K线。",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        try:
+            bars, context = _fetch_bars_v2_with_context(
+                market, code, count, cat, args.timeout, xdxr_list)
+        except (TdxV2Error, OSError) as e:
+            print(f"error: 复权K线取数失败（v2 不可用: {e}）", file=sys.stderr)
+            sys.exit(1)
+        if not bars:
+            print("error: 未取到K线数据。", file=sys.stderr)
+            sys.exit(1)
+        bars = fq_adjust.adjust_bars(bars, context, xdxr_list, fq)
 
     columns = [
-        ("日期", "日期", 12),
+        ("日期", "日期", 17 if intraday else 12),
         ("开盘", "开盘", 10),
         ("最高", "最高", 10),
         ("最低", "最低", 10),
@@ -180,55 +279,81 @@ def cmd_bars(args):
 
     rows = []
     for b in bars:
-        date_str = b.get("datetime", b.get("date", ""))
-        if isinstance(date_str, str) and len(date_str) > 10:
-            date_str = date_str[:10]
+        if isinstance(b, dict):  # 旧协议路径
+            date_str = b.get("datetime", b.get("date", ""))
+            if isinstance(date_str, str) and len(date_str) > 10 and not intraday:
+                date_str = date_str[:10]
+            o, h, l, c, vol = (b.get("open", 0), b.get("high", 0), b.get("low", 0),
+                               b.get("close", 0), b.get("vol", 0))
+        else:  # v2 Bar
+            s = str(b.date)
+            date_str = f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+            if intraday and b.time_sec:
+                date_str += f" {b.time_sec // 3600:02d}:{b.time_sec % 3600 // 60:02d}"
+            o, h, l, c, vol = b.open, b.high, b.low, b.close, b.vol
         rows.append({
             "日期": date_str,
-            "开盘": f"{b.get('open', 0):.2f}",
-            "最高": f"{b.get('high', 0):.2f}",
-            "最低": f"{b.get('low', 0):.2f}",
-            "收盘": f"{b.get('close', 0):.2f}",
-            "成交量": f"{b.get('vol', 0):,.0f}",
+            "开盘": f"{o:.2f}",
+            "最高": f"{h:.2f}",
+            "最低": f"{l:.2f}",
+            "收盘": f"{c:.2f}",
+            "成交量": f"{vol:,.0f}",
         })
 
     format_output(rows, columns, args.format)
 
 
 def cmd_minutes(args):
-    """分时数据"""
+    """分时数据（v2 协议当日分时，含均价）"""
+    from tdxrs.v2_client import TdxV2Client, TdxV2Error
+
     code = args.code
     market = auto_market(code)
     count = check_limit("minutes_count", getattr(args, "count", CLI_LIMITS["minutes_count"]["default"]))
 
-    client = make_client(args.timeout)
-    # 使用历史分时 API (支持今日数据，格式更可靠)
-    today = int(datetime.now().strftime('%Y%m%d'))
-    data = client.get_history_minute_time_data(market, code, today)
-
-    # 获取昨收价 (用于计算涨跌幅)
-    # 优先从实时行情获取 (新股/次新股 last_close 为 IPO 发行价)
-    # 回退到 K 线数据 (历史日期场景)
+    data = None
     yesterday_close = 0.0
     try:
-        quotes = client.get_security_quotes([(market, code)])
-        if quotes and quotes[0].get("last_close", 0) > 0:
-            yesterday_close = quotes[0]["last_close"]
-    except Exception:
-        pass
-    if yesterday_close <= 0:
+        with TdxV2Client(_V2_DEFAULT_HOST, timeout=args.timeout) as client:
+            data = client.get_minute_time_data(market, code)
+            try:
+                yesterday_close = client.get_quote(market, code)["last_close"]
+            except TdxV2Error:
+                pass
+    except (TdxV2Error, OSError) as e:
+        print(f"warn: v2 分时不可用({e})，尝试旧协议…", file=sys.stderr)
+
+    if not data:
+        # 旧协议回退（历史分时 API，多半已断供）
+        client = make_client(args.timeout)
+        today = int(datetime.now().strftime('%Y%m%d'))
+        raw = client.get_history_minute_time_data(market, code, today)
+        yesterday_close = 0.0
         try:
-            bars = client.get_security_bars(9, market, code, 0, 2)
-            if bars and len(bars) >= 2:
-                yesterday_close = bars[-2]["close"]
+            quotes = client.get_security_quotes([(market, code)])
+            if quotes and quotes[0].get("last_close", 0) > 0:
+                yesterday_close = quotes[0]["last_close"]
         except Exception:
             pass
+        if yesterday_close <= 0:
+            try:
+                bars = client.get_security_bars(9, market, code, 0, 2)
+                if bars and len(bars) >= 2:
+                    yesterday_close = bars[-2]["close"]
+            except Exception:
+                pass
+        if not raw:
+            print("error: 旧协议分时为空（服务端断供）且 v2 不可用。" + _STARVED_HINT,
+                  file=sys.stderr)
+            sys.exit(1)
+        data = [{"time": d.get("time", ""), "price": d.get("price", 0),
+                 "avg_price": d.get("avg_price", 0), "vol": d.get("vol", 0)} for d in raw]
 
-    # 限制返回数量 (数据已在 Rust 层倒序)
-    data = data[:count] if data else []
+    # 限制返回数量（v2 升序取最早 N 条；与旧协议倒序语义一致地取"最新"）
+    if len(data) > count:
+        data = data[-count:]
 
     columns = [
-        ("序号", "#", 6),
         ("时间", "时间", 8),
         ("价格", "价格", 10),
         ("涨跌幅%", "涨跌幅%", 8),
@@ -237,17 +362,20 @@ def cmd_minutes(args):
     ]
 
     rows = []
-    for i, d in enumerate(data):
-        price = d.get("price", 0)
-        # 涨跌幅 = (当前价 - 昨收) / 昨收 * 100
+    for d in data:
+        if isinstance(d, dict):  # 旧协议
+            time_str, price = d.get("time", ""), d.get("price", 0)
+            avg, vol = d.get("avg_price", 0), d.get("vol", 0)
+        else:  # v2 MinutePoint
+            time_str, price = d.time, d.price
+            avg, vol = d.avg_price, d.vol
         change_pct = ((price - yesterday_close) / yesterday_close * 100) if yesterday_close else 0
         rows.append({
-            "序号": str(i + 1),
-            "时间": d.get("time", ""),
+            "时间": time_str,
             "价格": f"{price:.2f}",
             "涨跌幅%": f"{change_pct:+.2f}",
-            "均价": f"{d.get('avg_price', 0):.2f}",
-            "成交量": f"{d.get('vol', 0):,.0f}",
+            "均价": f"{avg:.2f}",
+            "成交量": f"{vol:,.0f}",
         })
 
     format_output(rows, columns, args.format)
@@ -261,6 +389,12 @@ def cmd_trades(args):
 
     client = make_client(args.timeout)
     data = client.get_transaction_data(market, code, 0, count)
+
+    if not data:
+        print("error: 逐笔成交为空——服务端已断供旧协议逐笔功能族，"
+              "新协议逐笔帧尚未逆向。\n替代方案: `tdxrs minutes` 看分钟级量价。",
+              file=sys.stderr)
+        sys.exit(1)
 
     columns = [
         ("时间", "时间", 10),
@@ -293,6 +427,10 @@ def cmd_stocks(args):
     client = make_client(args.timeout)
     total = client.get_security_count(market)
     data = client.get_security_list(market, args.offset)
+
+    if not data:
+        print("error: 股票列表为空（目录类 API 异常或服务端变更）。", file=sys.stderr)
+        sys.exit(1)
 
     # 只取前 count 条
     data = data[:count] if data else []
@@ -345,7 +483,7 @@ def cmd_index(args):
     data = client.get_and_parse_block_info("block_zs.dat")
 
     if not data:
-        print("error: 无法获取板块数据", file=sys.stderr)
+        print("error: 无法获取板块数据（目录类 API 异常或服务端变更）。", file=sys.stderr)
         sys.exit(1)
 
     # 按板块名称分组
@@ -396,7 +534,11 @@ def cmd_xdxr(args):
     data = client.get_xdxr_info(market, code)
 
     if not data:
-        print(f"error: 未找到 {code} 的除权除息数据", file=sys.stderr)
+        print(
+            "error: 未找到除权除息数据——服务端已断供旧协议除权功能族，"
+            "新协议除权接口尚未逆向（2026-09 线缆级逆向结论）。",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     # 限制返回数量 (最新的在前)
@@ -460,6 +602,7 @@ def cmd_download(args):
         rate_limit=rps,
         format=args.format,
         fq=args.fq,
+        source=getattr(args, "source", "v2"),
     )
 
     # CLI 周期 → 下载器周期映射
@@ -491,6 +634,7 @@ def cmd_update(args):
         servers=args.servers.split(",") if args.servers else None,
         rate_limit=rps,
         format=args.format,
+        source=getattr(args, "source", "v2"),
     )
 
     markets = None if args.market == "all" else [args.market]
@@ -536,6 +680,9 @@ def cmd_download_xdxr(args):
 
     rps = check_limit("download_rps", args.rate_limit)
 
+    # 按代码前缀推断市场，避免在错误市场上无效查询（服务端会直接断连）
+    markets = ["sh" if auto_market(c) == MARKET_SH else "sz" for c in codes]
+
     dl = Downloader(
         data_dir=args.output,
         servers=args.servers.split(",") if args.servers else None,
@@ -544,7 +691,7 @@ def cmd_download_xdxr(args):
 
     print(f"下载除权除息数据: codes={codes}")
     print(f"保存位置: {dl.data_dir}")
-    dl.run_xdxr(codes=codes)
+    dl.run_xdxr(markets=sorted(set(markets)), codes=codes)
     print(f"下载完成: {dl.progress()}")
 
 
@@ -593,8 +740,8 @@ def cmd_parse(args):
                 "最高": f"{d[2]:.2f}",
                 "最低": f"{d[3]:.2f}",
                 "收盘": f"{d[4]:.2f}",
-                "成交量": f"{d[5]:,.0f}",
-                "成交额": f"{d[6]:,.0f}",
+                "成交额": f"{d[5]:,.0f}",
+                "成交量": f"{d[6]:,.0f}",
             })
 
     elif ftype == "min":
@@ -659,7 +806,7 @@ def cmd_parse(args):
 
 
 def cmd_servers(args):
-    """测试服务器连通性"""
+    """测试服务器连通性（目录类 + v2 行情数据面）"""
     import time
 
     print("测试服务器连通性...\n")
@@ -680,7 +827,7 @@ def cmd_servers(args):
             fail_count += 1
 
     total = ok_count + fail_count
-    print(f"可用服务器: {ok_count}/{total}")
+    print(f"目录类可用服务器 (旧协议): {ok_count}/{total}")
 
     if latencies:
         avg_latency = sum(latencies) / len(latencies)
@@ -688,6 +835,23 @@ def cmd_servers(args):
         max_latency = max(latencies)
         print(f"平均延迟: {avg_latency:.0f}ms")
         print(f"延迟范围: {min_latency:.0f}ms ~ {max_latency:.0f}ms")
+
+    # v2 行情数据面探测：目录类"活着"不代表行情没被断供，
+    # 用一次真实 K 线请求验证新协议数据面。
+    from tdxrs.v2_client import TdxV2Client
+
+    try:
+        start = time.time()
+        with TdxV2Client(_V2_DEFAULT_HOST, timeout=max(args.timeout, 6.0)) as client:
+            bars = client.get_bars(MARKET_SH, "600519", count=1)
+        elapsed = (time.time() - start) * 1000
+        if bars:
+            print(f"\n行情数据面 (v2 @{_V2_DEFAULT_HOST}): 正常 "
+                  f"({elapsed:.0f}ms, 最新日K {bars[-1].date})")
+        else:
+            print(f"\n行情数据面 (v2 @{_V2_DEFAULT_HOST}): 异常（空响应）")
+    except Exception as e:
+        print(f"\n行情数据面 (v2 @{_V2_DEFAULT_HOST}): 不可用 → {e}")
 
 
 def cmd_version(args):
@@ -699,9 +863,119 @@ def cmd_version(args):
 
 
 # ============================================================
-# 主入口
+# 新一代 7709 协议（v2）
+#
+# 2026-07 起服务端对旧帧（0c 02 系）按功能族断供行情数据（快照/K线/
+# 分时/除权静默返回空，目录/财务类仍应答），官方客户端改用新帧格式。
+# 本命令组走 tdxrs.v2_client（逆向实现，详见该模块 docstring 与 research/）。
 # ============================================================
 
+_V2_DEFAULT_HOST = "121.36.248.138"
+
+
+def _add_v2_args(p):
+    p.add_argument("--host", default=_V2_DEFAULT_HOST, help=f"行情服务器 (默认{_V2_DEFAULT_HOST})")
+    p.add_argument("--port", type=int, default=7709, help="端口 (默认7709)")
+    p.add_argument("--timeout", type=float, default=6.0, help="超时秒数 (默认6)")
+    p.add_argument("--format", choices=["table", "json", "csv"], default="table")
+
+
+def cmd_v2_quote(args):
+    """实时行情（新协议）"""
+    from tdxrs.v2_client import TdxV2Client
+
+    codes = [c.strip() for c in args.code.split(",") if c.strip()]
+    if not codes:
+        print("error: 请指定至少一个股票代码", file=sys.stderr)
+        sys.exit(1)
+    check_limit("quote_codes", len(codes))
+
+    columns = [
+        ("代码", "代码", 8), ("昨收", "昨收", 10), ("开盘", "开盘", 10),
+        ("最高", "最高", 10), ("最低", "最低", 10), ("最新", "最新", 10),
+        ("涨跌%", "涨跌%", 8), ("成交量(股)", "成交量(股)", 14), ("成交额", "成交额", 14),
+    ]
+    rows = []
+    with TdxV2Client(args.host, args.port, timeout=args.timeout) as client:
+        for code in codes:
+            row = client.get_quote(auto_market(code), code)
+            change = (
+                (row["price"] - row["last_close"]) / row["last_close"] * 100
+                if row["last_close"] else 0.0
+            )
+            rows.append({
+                "代码": code,
+                "昨收": f"{row['last_close']:.2f}",
+                "开盘": f"{row['open']:.2f}",
+                "最高": f"{row['high']:.2f}",
+                "最低": f"{row['low']:.2f}",
+                "最新": f"{row['price']:.2f}",
+                "涨跌%": f"{change:+.2f}",
+                "成交量(股)": f"{row['vol']:,.0f}",
+                "成交额": f"{row['amount']:,.0f}",
+            })
+    format_output(rows, columns, args.format)
+
+
+def cmd_v2_bars(args):
+    """K线数据（新协议；全周期可用，复权需除权接口——尚未逆向）"""
+    from tdxrs.v2_client import TdxV2Client
+
+    cat = _CATEGORY_MAP.get(args.category)
+    if cat is None:
+        print(f"error: 不支持的周期 '{args.category}'", file=sys.stderr)
+        sys.exit(1)
+    count = check_limit("bars_count", args.count)
+    intraday = args.category in ("5min", "15min", "30min", "60min")
+    columns = [
+        ("日期", "日期", 17 if intraday else 12), ("开盘", "开盘", 10), ("最高", "最高", 10),
+        ("最低", "最低", 10), ("收盘", "收盘", 10), ("成交量(股)", "成交量(股)", 14),
+        ("成交额", "成交额", 16),
+    ]
+    with TdxV2Client(args.host, args.port, timeout=args.timeout) as client:
+        bars = client.get_bars(auto_market(args.code), args.code,
+                               count=min(count, 700), category=cat,
+                               start=args.start)
+    rows = []
+    for bar in bars:
+        s = str(bar.date)
+        date_str = f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+        if intraday and bar.time_sec:
+            date_str += f" {bar.time_sec // 3600:02d}:{bar.time_sec % 3600 // 60:02d}"
+        rows.append({
+            "日期": date_str,
+            "开盘": f"{bar.open:.2f}",
+            "最高": f"{bar.high:.2f}",
+            "最低": f"{bar.low:.2f}",
+            "收盘": f"{bar.close:.2f}",
+            "成交量(股)": f"{bar.vol:,.0f}",
+            "成交额": f"{bar.amount:,.0f}",
+        })
+    format_output(rows, columns, args.format)
+
+
+def cmd_v2_minutes(args):
+    """当日分时（新协议，含均价）"""
+    from tdxrs.v2_client import TdxV2Client
+
+    columns = [
+        ("时间", "时间", 8), ("价格", "价格", 10), ("均价", "均价", 10),
+        ("成交量(股)", "成交量(股)", 14),
+    ]
+    with TdxV2Client(args.host, args.port, timeout=args.timeout) as client:
+        points = client.get_minute_time_data(auto_market(args.code), args.code)
+    rows = [{
+        "时间": pt.time,
+        "价格": f"{pt.price:.2f}",
+        "均价": f"{pt.avg_price:.2f}",
+        "成交量(股)": f"{pt.vol:,.0f}",
+    } for pt in points]
+    format_output(rows, columns, args.format)
+
+
+# ============================================================
+# 主入口
+# ============================================================
 def main():
     parser = argparse.ArgumentParser(
         prog="tdxrs",
@@ -796,6 +1070,8 @@ def main():
     p.add_argument("--servers", help="服务器列表，逗号分隔")
     p.add_argument("--rate-limit", type=int, default=CLI_LIMITS["download_rps"]["default"],
                     help=f"限速 req/s (默认{CLI_LIMITS['download_rps']['default']}，上限{CLI_LIMITS['download_rps']['max']})")
+    p.add_argument("--source", default="v2", choices=["v2", "old"],
+                   help="行情数据源: v2=新协议(默认) old=旧协议(已断供)")
     p.set_defaults(func=cmd_download)
 
     # ── update ──
@@ -810,6 +1086,8 @@ def main():
     p.add_argument("--servers", help="服务器列表，逗号分隔")
     p.add_argument("--rate-limit", type=int, default=CLI_LIMITS["download_rps"]["default"],
                     help=f"限速 req/s (默认{CLI_LIMITS['download_rps']['default']}，上限{CLI_LIMITS['download_rps']['max']})")
+    p.add_argument("--source", default="v2", choices=["v2", "old"],
+                   help="行情数据源: v2=新协议(默认) old=旧协议(已断供)")
     p.set_defaults(func=cmd_update)
 
     # ── download-xdxr ──
@@ -832,8 +1110,33 @@ def main():
 
     # ── servers ──
     p = sub.add_parser("servers", help="测试服务器连通性")
-    p.add_argument("--timeout", type=float, default=3.0, help="超时秒数 (默认3)")
+    p.add_argument("--timeout", type=float, default=5.0)
     p.set_defaults(func=cmd_servers)
+
+    # ── v2（新一代 7709 协议：2026-07 起旧协议行情断供的替代通道）──
+    p = sub.add_parser("v2", help="新一代 7709 协议（实时行情/K线/分时）")
+    v2_sub = p.add_subparsers(dest="v2_command", required=True)
+
+    q = v2_sub.add_parser("quote", help="实时行情")
+    q.add_argument("code", help="股票代码，多只用逗号分隔 (最多20)")
+    _add_v2_args(q)
+    q.set_defaults(func=cmd_v2_quote)
+
+    b = v2_sub.add_parser("bars", help="K线数据（全周期）")
+    b.add_argument("code", help="股票代码")
+    b.add_argument("--category", default="day", choices=list(_CATEGORY_MAP.keys()),
+                   help="周期 (默认day)")
+    b.add_argument("--start", type=int, default=0,
+                   help="起始偏移 (0=最新窗口，>0 向历史前移)")
+    b.add_argument("--count", type=int, default=CLI_LIMITS["bars_count"]["default"],
+                    help=f"条数 (默认{CLI_LIMITS['bars_count']['default']}，服务端单次上限700)")
+    _add_v2_args(b)
+    b.set_defaults(func=cmd_v2_bars)
+
+    m = v2_sub.add_parser("minutes", help="当日分时")
+    m.add_argument("code", help="股票代码")
+    _add_v2_args(m)
+    m.set_defaults(func=cmd_v2_minutes)
 
     # ── version ──
     p = sub.add_parser("version", help="版本信息")

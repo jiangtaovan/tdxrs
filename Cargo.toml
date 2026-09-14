@@ -1,6 +1,6 @@
 [package]
 name = "tdxrs"
-version = "0.6.7"
+version = "0.6.8"
 edition = "2021"
 description = "TDX (通达信) market data parser — Rust implementation with Python bindings"
 license = "MIT"

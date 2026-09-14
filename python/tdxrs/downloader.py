@@ -198,6 +198,10 @@ class Downloader:
         输出格式: "tdx"(默认, 可被 DailyBarReader 直接读取) / "csv" / "parquet"。
     fq : int
         复权类型: 0=不复权, 1=前复权, 2=后复权。
+    source : str
+        行情数据源: "v2"(默认, 新一代 7709 协议，旧协议 K 线已断供) / "old"。
+        v2 复权 = 原始K线 + 旧协议除权记录本地调整；北交所仍走旧协议（市场字节未验证）；
+        股票列表/元数据始终走旧协议目录类 API。
 
     Example
     -------
@@ -214,11 +218,16 @@ class Downloader:
     """
 
     def __init__(self, data_dir="./data", servers=None, rate_limit=15,
-                 format="tdx", fq=0):
+                 format="tdx", fq=0, source="v2", v2_host=None):
         # 路径标准化: 展开 ~ / ~user, 解析为绝对路径
         self.data_dir = Path(data_dir).expanduser().resolve()
         self.format = format
         self.fq = fq
+        self.source = source
+        if v2_host is None:
+            from tdxrs.v2_client import _DEFAULT_HOST as _V2_HOST
+            v2_host = _V2_HOST
+        self.v2_host = v2_host
         self.pool = ServerPool(servers=servers, rate_limit=rate_limit)
 
         # 元数据目录
@@ -389,10 +398,18 @@ class Downloader:
         codes : list[str] | None
             股票代码列表，None = 全市场。
         """
+        # 2026-07 起服务端对旧协议除权功能族静默断供：先探针一只，全空则直接报错，
+        # 避免对全市场数千只股票做无效扫描。
+        market_map = {"sh": MARKET_SH, "sz": MARKET_SZ}
         if markets is None:
             markets = ["sh", "sz"]
-
-        market_map = {"sh": MARKET_SH, "sz": MARKET_SZ}
+        probe_mkt = market_map.get(markets[0], MARKET_SH)
+        probe_code = codes[0] if codes else "600519"
+        name, client = self.pool.next_client()
+        if not client.get_xdxr_info(probe_mkt, probe_code):
+            print("[ERROR] 除权除息下载不可用——服务端已断供旧协议除权功能族，"
+                  "新协议除权接口尚未逆向（2026-09 线缆级逆向结论）。")
+            return
 
         for market_name in markets:
             market = market_map.get(market_name)
@@ -511,18 +528,30 @@ class Downloader:
 
         # 自动翻页拉取
         all_bars = []
-        offset = 0
-        while True:
-            name, client = self.pool.next_client(is_minute)
-            bars = client.get_security_bars(
-                category, market, code, offset, max_per_req, self.fq
-            )
-            if not bars:
-                break
-            all_bars.extend(bars)
-            if len(bars) < max_per_req:
-                break
-            offset += max_per_req
+        if self.source == "v2" and market != MARKET_BJ:
+            # v2 数据源：新协议市场字节未验证北交所(92xxxx)，北交走旧协议
+            raw_bars = self._fetch_bars_v2_raw(market, code, category,
+                                               min(max_per_req, 700), is_minute)
+            if raw_bars and self.fq != 0:
+                # 旧协议除权目录接口仍存活：全量历史自身即上下文，本地复权
+                from tdxrs import adjust as fq_adjust
+                name, client = self.pool.next_client(is_minute)
+                xdxr_list = client.get_xdxr_info(market, code) or []
+                raw_bars = fq_adjust.adjust_bars(raw_bars, [], xdxr_list, self.fq)
+            all_bars = [self._bar_to_dict(b, is_minute) for b in raw_bars]
+        else:
+            offset = 0
+            while True:
+                name, client = self.pool.next_client(is_minute)
+                bars = client.get_security_bars(
+                    category, market, code, offset, max_per_req, self.fq
+                )
+                if not bars:
+                    break
+                all_bars.extend(bars)
+                if len(bars) < max_per_req:
+                    break
+                offset += max_per_req
 
         if not all_bars:
             return 0
@@ -554,6 +583,43 @@ class Downloader:
             self._update_sync(market, code, dir_name, last_date)
 
         return len(all_bars)
+
+    def _fetch_bars_v2_raw(self, market, code, category, max_per_req, is_minute=False):
+        """v2 协议翻页拉取单只股票 K 线，返回按时间升序的 Bar 列表。
+
+        start 偏移向历史方向前移，窗口实测与最新窗口无缝衔接；
+        单次响应上限 700 条（payload u16 长度字段约束）。
+        """
+        from tdxrs.v2_client import TdxV2Client
+
+        pages = []
+        start = 0
+        with TdxV2Client(self.v2_host, timeout=15.0) as client:
+            while True:
+                batch = client.get_bars(market, code, count=max_per_req,
+                                        category=category, start=start)
+                if not batch:
+                    break
+                pages.append(batch)
+                if len(batch) < max_per_req:
+                    break
+                start += len(batch)
+
+        bars = []
+        for page in reversed(pages):  # start 大的历史页在前 → 整体升序
+            bars.extend(page)
+        return bars
+
+    def _bar_to_dict(self, b, is_minute=False):
+        """v2 Bar → 下载器写入契约 dict。"""
+        date_s = f"{b.date // 10000:04d}-{b.date // 100 % 100:02d}-{b.date % 100:02d}"
+        if is_minute and b.time_sec:
+            date_s += f" {b.time_sec // 3600:02d}:{b.time_sec % 3600 // 60:02d}"
+        return {
+            "datetime": date_s,
+            "open": b.open, "high": b.high, "low": b.low, "close": b.close,
+            "amount": b.amount, "vol": b.vol,
+        }
 
     def _get_existing_last_date(self, path):
         """读取已有文件的最后日期"""
