@@ -60,9 +60,36 @@ tests/dev/
 examples/dev/
 
 # ============================================================
+# Ad-hoc verification/debug scripts — 仅留在磁盘, 不做版本管理
+# (2026-11-01: 回退 2aadb15 中误入库的临时脚本;
+#  策略: 非 src/ python/ 的代码/脚本一律不入库)
+# ============================================================
+# tests/ 下的探测/调试脚本及数据
+tests/probe_*.py
+tests/probe_*.tsv
+tests/debug_*.py
+tests/test_build_pool.py
+tests/test_connection_reuse.py
+# examples/ 下的一次性验证脚本 (正式示例 demo_* / gen_* 仍入库)
+examples/test_fq_*.py
+examples/test_minute_*.py
+examples/test_volume_match.py
+examples/test_bj_stocks.py
+
+# ============================================================
 # Downloaded market data (local cache, not part of release)
 # ============================================================
 data/
+
+# ============================================================
+# tfdata 模块 — 已冻结, 由具体项目独立管理, 不入库 (2026-10-31)
+# ============================================================
+tfdata/
+# tickflow (tfdata 关联: 港美股 tick 流文档与测试数据)
+docs/tickflow/
+tests/tickflow_data/
+examples/test_tickflow.py
+tests/test_tickflow_hk_us.py
 
 # ============================================================
 # Original Python tdxpy reference (not part of Rust project)
@@ -72,12 +99,18 @@ tdxpy/
 # ============================================================
 # Docs — temporary / archive
 # ============================================================
-docs/dev/               # 非正式开发笔记
-docs/del/               # 已弃用文档备份
-docs/demo-F10/          # F10 示例数据 (合规考虑不入库)
+# 非正式开发笔记
+docs/dev/
+# 已弃用文档备份
+docs/del/
+# F10 示例数据 (合规考虑不入库)
+docs/demo-F10/
+# Issue 根因分析草稿 (本地参考, 不入库)
+docs/issue/
 /docs/private/
-docs/WORK_LOG_*.md      # 旧版日志 (新版为 WORK_LOG.md)
-docs/tdxrs_quality_*.md      # 旧版日志 (新版为 WORK_LOG.md)
+# 旧版日志 (新版为 WORK_LOG.md)
+docs/WORK_LOG_*.md
+docs/tdxrs_quality_*.md
 
 # Removed modules (no longer in project)
 /docs/public/ETF.md
@@ -89,6 +122,7 @@ docs/tdxrs_quality_*.md      # 旧版日志 (新版为 WORK_LOG.md)
 examples/*.png
 docs/public/bench_*.png
 examples/local/
+examples/f10/
 examples/output/
 examples/test_output/
 

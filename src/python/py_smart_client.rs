@@ -7,6 +7,7 @@ use pyo3::types::{PyDict, PyList};
 use pyo3::IntoPyObjectExt;
 
 use crate::net::smart_client::TdxSmartClient;
+use crate::net::utils::HandshakeMode;
 
 /// 智能连接客户端
 ///
@@ -39,6 +40,36 @@ impl PyTdxSmartClient {
         self.client
             .connect_to_any(timeout)
             .map_err(|e| pyo3::exceptions::PyConnectionError::new_err(e.to_string()))
+    }
+
+    /// 设置握手模式 (Issue #12)
+    ///
+    /// 可选值: "full" / "skip_cmd3" / "cmd1_only" / "none"
+    #[pyo3(signature = (mode))]
+    fn set_handshake_mode(&self, mode: &str) -> PyResult<()> {
+        let m = match mode {
+            "full" | "Full" => HandshakeMode::Full,
+            "skip_cmd3" | "SkipCmd3" => HandshakeMode::SkipCmd3,
+            "cmd1_only" | "Cmd1Only" => HandshakeMode::Cmd1Only,
+            "none" | "None" => HandshakeMode::None,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "mode must be one of: 'full', 'skip_cmd3', 'cmd1_only', 'none'"
+                ));
+            }
+        };
+        self.client.set_handshake_mode(m);
+        Ok(())
+    }
+
+    /// 获取当前握手模式
+    fn handshake_mode(&self) -> &'static str {
+        match self.client.handshake_mode() {
+            HandshakeMode::Full => "full",
+            HandshakeMode::SkipCmd3 => "skip_cmd3",
+            HandshakeMode::Cmd1Only => "cmd1_only",
+            HandshakeMode::None => "none",
+        }
     }
 
     /// 获取 K 线数据 (带自动重试)

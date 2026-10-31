@@ -5,7 +5,40 @@ on:
     tags: ["v*.*.*"]
 
 jobs:
+  # ── 自动创建 GitHub Release ──
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+      - name: Extract changelog for this version
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # 从 CHANGELOG.md 提取当前版本的说明 (匹配 "## vX.Y.Z" 到下一个 "## " 之间)
+          NOTES=$(sed -n "/^## v${VERSION}/,/^## v/{/^## v${VERSION}/p;/^## v/!p;}" docs/public/CHANGELOG.md | tail -n +2 | head -n -1)
+          # 如果没有匹配到，使用默认说明
+          if [ -z "$NOTES" ]; then
+            NOTES="Release v${VERSION}\n\nSee [CHANGELOG](docs/public/CHANGELOG.md) for details."
+          fi
+          # 写入文件 (避免多行变量问题)
+          echo "$NOTES" > /tmp/release_notes.md
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: v${{ steps.version.outputs.version }}
+          body_path: /tmp/release_notes.md
+          draft: false
+          prerelease: false
+
+  # ── 多平台构建 + 发布到 PyPI ──
   linux:
+    needs: release
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

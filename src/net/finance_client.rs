@@ -23,6 +23,7 @@ use flate2::read::ZlibDecoder;
 use std::fs;
 use std::io::Read;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::error::Result;
@@ -50,6 +51,8 @@ pub struct TdxFinanceClient {
     port: u16,
     timeout: f64,
     cache_dir: Option<PathBuf>,
+    /// 握手模式 (Issue #12)
+    handshake_mode: AtomicU8,
 }
 
 impl TdxFinanceClient {
@@ -59,7 +62,18 @@ impl TdxFinanceClient {
             port,
             timeout: timeout.unwrap_or(DEFAULT_FINANCE_TIMEOUT),
             cache_dir: None,
+            handshake_mode: AtomicU8::new(utils::HandshakeMode::Full as u8),
         }
+    }
+
+    /// 获取当前握手模式
+    pub fn handshake_mode(&self) -> utils::HandshakeMode {
+        utils::HandshakeMode::from_u8(self.handshake_mode.load(Ordering::Relaxed))
+    }
+
+    /// 设置握手模式
+    pub fn set_handshake_mode(&self, mode: utils::HandshakeMode) {
+        self.handshake_mode.store(mode as u8, Ordering::Relaxed);
     }
 
     pub fn set_server(&mut self, ip: &str, port: u16) {
@@ -127,7 +141,7 @@ impl TdxFinanceClient {
                 loge!("finance", "connect to {}:{} failed: {}", self.ip, self.port, e);
                 e
             })?;
-        utils::perform_handshake(&mut conn)?;
+        utils::perform_handshake_with_mode(&mut conn, self.handshake_mode())?;
 
         conn.send(packet)?;
 

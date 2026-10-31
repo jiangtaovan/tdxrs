@@ -12,7 +12,7 @@ fn main() {
 
     // 1. 创建客户端并连接
     let client = TdxHqClient::new();
-    match client.connect("218.75.126.9", 7709, Some(5.0)) {
+    match client.connect("139.9.52.158", 7709, Some(5.0)) {
         Ok(true) => println!("[OK] Connected to server"),
         Ok(false) => println!("[FAIL] Connection rejected"),
         Err(e) => {

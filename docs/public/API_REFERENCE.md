@@ -221,7 +221,24 @@ TDXRS_LOG=debug python your_script.py
 | `set_rate_limit(rps: int)` | 默认限流 (req/s)，0=禁用，默认 50，上限 200 |
 | `set_rate_limit_daily(rps: int)` | 日K 限流 (req/s)，0=禁用，默认 15，上限 200 |
 | `rate_limit_minute()` → `int` | 分时限流 (固定 10 req/s，不可修改) |
+| `set_handshake_mode(mode: str)` | 握手模式: `"full"`(默认) / `"skip_cmd3"` / `"cmd1_only"` / `"none"` |
+| `handshake_mode()` → `str` | 获取当前握手模式 |
 | `pool_stats()` → `{"idle": int, "active": int, "total": int, "max_size": int}` | 连接池状态 |
+
+**握手模式说明** (Issue #12):
+
+部分通达信服务器在收到 `SETUP_CMD3` (0x1899) 后会拒绝行情数据 (K线/行情/逐笔返回空)。
+若遇到此类问题，切换为 `"skip_cmd3"` 模式可恢复:
+
+```python
+client = tdxrs.TdxHqClient()
+client.set_handshake_mode("skip_cmd3")  # 跳过 cmd3，仅发 cmd1+cmd2
+client.connect_to_any()
+bars = client.get_security_bars(4, 1, "600519", 0, 100, 0)  # 正常返回数据
+```
+
+所有客户端均支持 `set_handshake_mode()`:
+`TdxHqClient` / `TdxSmartClient` / `TdxDirectClient` / `TdxBlockClient` / `TdxHqFundClient` / `AsyncTdxHqClient`
 
 ---
 
@@ -405,6 +422,8 @@ get_security_quotes_tuples(stocks) -> list[tuple]
 **返回字段 (dict)**: `market`, `code`, `price`, `last_close`, `open`, `high`, `low`, `vol`, `cur_vol`, `amount`, `s_vol`, `b_vol`, `bid1`～`bid5`, `ask1`～`ask5`, `bid_vol1`～`bid_vol5`, `ask_vol1`～`ask_vol5`, `servertime`
 
 > 行情无缓存，每次实时查询。**单次最多查询 60 只**，超出部分自动截断。如需查询更多，请自行分组调用后合并结果。
+>
+> **自动重试 (v0.6.7)**: 某些服务器不支持实时行情，首次查询返回空时自动切换服务器重试。最多重试 3 次。
 
 ```python
 # 单只
@@ -608,6 +627,7 @@ client = AsyncTdxHqClient()
 | 限流 | std::sync::Mutex | tokio::sync::Mutex |
 | Python 调用 | 同步阻塞 | 同步阻塞 (内部 block_on) |
 | GIL 释放 | 否 | 否 (与 TdxHqClient 一致) |
+| 空响应重试 | ✅ K线 + 行情 | ✅ K线 + 行情 (v0.6.7) |
 | 适用场景 | 通用，首选 | 高并发批量请求、tokio 生态集成 |
 
 > **Python 调用方式与 TdxHqClient 完全一致** — 所有方法同步返回，内部通过 `tokio::runtime::Runtime::block_on()` 执行异步操作。
@@ -843,6 +863,7 @@ client = TdxSmartClient()
 | 惰性健康检查 | 首次 K 线请求返回空时触发，自动切换服务器 |
 | 本地缓存 | `~/.tdxrs/server_cache.json` 记录成功/失败服务器 |
 | 黑名单机制 | 连续失败的服务器自动加入黑名单 (24h 过期) |
+| 真实K线探测 (v0.6.9) | `probe_and_cache` 拉取一根日K验证数据，握手成功但 K 线为空记为失败 |
 
 #### 方法
 
@@ -853,7 +874,7 @@ client = TdxSmartClient()
 | `get_security_quotes(...)` | `list[dict]` | 获取实时行情 (带自动重试) |
 | `cache_stats()` | `str` | 获取缓存统计信息 |
 | `clear_cache()` | — | 清除缓存 |
-| `probe_and_cache(timeout)` | `list` | 探测所有服务器并更新缓存 |
+| `probe_and_cache(timeout)` | `list` | 探测所有服务器并更新缓存 (真实K线验证) |
 | `disconnect()` | — | 断开连接 |
 | `is_connected()` | `bool` | 是否已连接 |
 
@@ -865,6 +886,9 @@ from tdxrs import TdxSmartClient
 # 创建智能客户端
 client = TdxSmartClient()
 
+# Issue #12: 服务器拒绝行情时切换为 SkipCmd3 (cmd1+cmd2 握手)
+client.set_handshake_mode("skip_cmd3")
+
 # 连接 (自动使用缓存，跳过黑名单服务器)
 client.connect_to_any(timeout=10.0)
 
@@ -874,7 +898,7 @@ bars = client.get_security_bars(4, 1, '600519', 0, 10, 0)
 # 查看缓存状态
 print(client.cache_stats())
 
-# 探测所有服务器并更新缓存 (类似 mootdx bestip)
+# 探测所有服务器并更新缓存 (真实K线验证: 拉一根日K，数据非空才算可用)
 results = client.probe_and_cache(3.0)
 for ip, port, name, latency in results:
     print(f"{name}: {latency}ms")
@@ -962,11 +986,11 @@ from tdxrs import TdxBlockClient
 
 client = TdxBlockClient("58.63.254.191", 7709, 5.0)
 
-# 板块K线 (自动限制)
+# 板块K线 (自动限制 + 空响应自动重试)
 bars = client.get_block_bars(4, "880001", 0, 100)  # 日K
 bars = client.get_block_bars(0, "881001", 0, 0)    # 5min (默认50条)
 
-# 实时行情
+# 实时行情 (空响应自动重试)
 quotes = client.get_block_quotes(["880001", "881001"])
 
 # 板块列表 (从服务器下载 .dat 文件)
@@ -993,6 +1017,8 @@ custom = client.get_block_list("block.dat")  # 自定义文件
 | 60min | 200 | 800 | |
 | 30min/15min/5min | 50 | 200 | |
 | 1min | — | — | **禁用** |
+
+**空响应自动重试**: `get_block_bars` (日K及以上) 和 `get_block_quotes` 返回空数据时，自动遍历 PRIMARY_SERVERS 切换服务器重试，最多 5 次。用户指定的服务器优先尝试，不在 PRIMARY_SERVERS 中的会插入到候选列表首位。
 
 **禁用接口**: 分时数据、逐笔成交（板块数据无意义）
 

@@ -49,6 +49,66 @@ impl Default for FqContextTier {
 }
 
 // ================================================================
+// 握手模式
+// ================================================================
+
+/// TDX 握手模式
+///
+/// 控制连接建立时发送哪些握手命令。
+///
+/// 背景 (Issue #12): 部分通达信服务器在收到 `SETUP_CMD3` (0x1899) 后，
+/// 会将该包视为"客户端引擎版本上报"，版本不被认可时掐掉整个会话的行情权限，
+/// 此后 K线/行情/逐笔接口一律返回 2 字节 `0x2003`。
+/// 污染在连接内不可逆，只有新建连接且不发 cmd3 才能恢复。
+///
+/// | 模式 | 发送命令 | 适用场景 |
+/// |------|---------|---------|
+/// | `Full` | cmd1 + cmd2 + cmd3 | 默认，兼容旧行为 |
+/// | `SkipCmd3` | cmd1 + cmd2 | 服务器拒绝行情时使用 |
+/// | `Cmd1Only` | 仅 cmd1 | 最小握手 |
+/// | `None` | 不发送 | 已由外部完成握手 |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeMode {
+    /// 完整三步握手: cmd1 + cmd2 + cmd3 (默认)
+    Full = 0,
+    /// 跳过 cmd3: cmd1 + cmd2 (解决 Issue #12)
+    SkipCmd3 = 1,
+    /// 仅 cmd1
+    Cmd1Only = 2,
+    /// 不发送任何握手命令
+    None = 3,
+}
+
+impl HandshakeMode {
+    /// 获取该模式对应的握手命令列表
+    pub fn commands(&self) -> &'static [&'static [u8]] {
+        match self {
+            HandshakeMode::Full => &[SETUP_CMD1, SETUP_CMD2, SETUP_CMD3],
+            HandshakeMode::SkipCmd3 => &[SETUP_CMD1, SETUP_CMD2],
+            HandshakeMode::Cmd1Only => &[SETUP_CMD1],
+            HandshakeMode::None => &[],
+        }
+    }
+
+    /// 从 u8 转换 (用于 AtomicU8 存储)
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => HandshakeMode::Full,
+            1 => HandshakeMode::SkipCmd3,
+            2 => HandshakeMode::Cmd1Only,
+            3 => HandshakeMode::None,
+            _ => HandshakeMode::Full,
+        }
+    }
+}
+
+impl Default for HandshakeMode {
+    fn default() -> Self {
+        HandshakeMode::Full
+    }
+}
+
+// ================================================================
 // 交易阶段检测
 // ================================================================
 
@@ -351,9 +411,28 @@ pub fn build_index_bars_packet(
 // 握手 / 响应处理
 // ================================================================
 
-/// 执行 TDX 三步握手协议 (同步)
+/// 执行 TDX 握手协议 (同步)
+///
+/// 默认使用 `HandshakeMode::Full` (cmd1 + cmd2 + cmd3)，保持向后兼容。
+/// 如需跳过 cmd3，使用 `perform_handshake_with_mode`。
 pub fn perform_handshake(conn: &mut TcpConnection) -> Result<()> {
-    for cmd in &[SETUP_CMD1, SETUP_CMD2, SETUP_CMD3] {
+    perform_handshake_with_mode(conn, HandshakeMode::Full)
+}
+
+/// 按指定模式执行 TDX 握手协议 (同步)
+///
+/// # 示例
+/// ```rust
+/// use tdxrs::net::utils::{perform_handshake_with_mode, HandshakeMode};
+///
+/// let mut conn = TcpConnection::connect("59.36.5.11", 7709, 5.0)?;
+/// perform_handshake_with_mode(&mut conn, HandshakeMode::SkipCmd3)?;
+/// ```
+pub fn perform_handshake_with_mode(
+    conn: &mut TcpConnection,
+    mode: HandshakeMode,
+) -> Result<()> {
+    for cmd in mode.commands() {
         conn.send(cmd)?;
         let (head, body) = read_response_raw(conn)?;
         if head.zip_size != head.unzip_size {
@@ -480,6 +559,50 @@ pub fn fetch_context_bars_for_adjust_with_tier<F: Fn(&[u8]) -> Result<Vec<u8>>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_handshake_mode_default() {
+        assert_eq!(HandshakeMode::default(), HandshakeMode::Full);
+    }
+
+    #[test]
+    fn test_handshake_mode_commands() {
+        assert_eq!(HandshakeMode::Full.commands().len(), 3);
+        assert_eq!(HandshakeMode::SkipCmd3.commands().len(), 2);
+        assert_eq!(HandshakeMode::Cmd1Only.commands().len(), 1);
+        assert_eq!(HandshakeMode::None.commands().len(), 0);
+    }
+
+    #[test]
+    fn test_handshake_mode_skip_cmd3_excludes_cmd3() {
+        let cmds = HandshakeMode::SkipCmd3.commands();
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].len(), SETUP_CMD1.len());
+        assert_eq!(cmds[1].len(), SETUP_CMD2.len());
+        // 确认不包含 CMD3 (长度不同: cmd1/cmd2=13B, cmd3=42B)
+        for cmd in cmds {
+            assert_ne!(cmd.len(), SETUP_CMD3.len());
+        }
+    }
+
+    #[test]
+    fn test_handshake_mode_full_includes_cmd3() {
+        let cmds = HandshakeMode::Full.commands();
+        assert_eq!(cmds.len(), 3);
+        assert_eq!(cmds[2].len(), SETUP_CMD3.len());
+        // 逐字节确认是 CMD3
+        assert!(cmds[2].iter().zip(SETUP_CMD3).all(|(a, b)| a == b));
+    }
+
+    #[test]
+    fn test_handshake_mode_from_u8() {
+        assert_eq!(HandshakeMode::from_u8(0), HandshakeMode::Full);
+        assert_eq!(HandshakeMode::from_u8(1), HandshakeMode::SkipCmd3);
+        assert_eq!(HandshakeMode::from_u8(2), HandshakeMode::Cmd1Only);
+        assert_eq!(HandshakeMode::from_u8(3), HandshakeMode::None);
+        // 无效值回退到 Full
+        assert_eq!(HandshakeMode::from_u8(99), HandshakeMode::Full);
+    }
 
     #[test]
     fn test_code_bytes_full() {

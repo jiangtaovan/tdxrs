@@ -47,14 +47,19 @@ pub struct TdxHqClient {
     rate_limiter_minute: RateLimiter,
     /// 复权上下文数据量档位 (默认 Mid ≈ 20 年), 以 u8 存储
     fq_context_tier: AtomicU8,
+    /// 握手模式 (Issue #12: Full=三步, SkipCmd3=跳过 cmd3), 以 u8 存储
+    handshake_mode: Arc<AtomicU8>,
 }
 
 impl TdxHqClient {
     pub fn new() -> Self {
+        let handshake_mode = Arc::new(AtomicU8::new(utils::HandshakeMode::Full as u8));
+        let mode_for_closure = handshake_mode.clone();
         let mut config = PoolConfig::default();
         // 设置握手回调，让连接池自动为新连接执行握手
-        config.handshake_fn = Some(Box::new(|conn: &mut TcpConnection| -> Result<()> {
-            utils::perform_handshake(conn)
+        config.handshake_fn = Some(Box::new(move |conn: &mut TcpConnection| -> Result<()> {
+            let mode = utils::HandshakeMode::from_u8(mode_for_closure.load(Ordering::Relaxed));
+            utils::perform_handshake_with_mode(conn, mode)
         }));
         let default_server = (
             PRIMARY_SERVERS[0].1.to_string(),
@@ -77,6 +82,7 @@ impl TdxHqClient {
             rate_limiter_daily: RateLimiter::new(67), // 日K 15 req/s
             rate_limiter_minute: RateLimiter::new(100), // 分时 10 req/s (不允许解禁)
             fq_context_tier: AtomicU8::new(utils::FqContextTier::default() as u8),
+            handshake_mode,
         }
     }
 
@@ -89,6 +95,24 @@ impl TdxHqClient {
             ));
         }
         Ok(())
+    }
+
+    /// 获取当前握手模式
+    pub fn handshake_mode(&self) -> utils::HandshakeMode {
+        utils::HandshakeMode::from_u8(self.handshake_mode.load(Ordering::Relaxed))
+    }
+
+    /// 设置握手模式
+    ///
+    /// 默认 `HandshakeMode::Full`。若服务器拒绝行情数据 (返回空/K线异常)，
+    /// 可切换为 `HandshakeMode::SkipCmd3` 跳过 SETUP_CMD3。
+    pub fn set_handshake_mode(&self, mode: utils::HandshakeMode) {
+        self.handshake_mode.store(mode as u8, Ordering::Relaxed);
+    }
+
+    /// 执行握手 (使用当前配置的模式)
+    fn do_handshake(&self, conn: &mut TcpConnection) -> Result<()> {
+        utils::perform_handshake_with_mode(conn, self.handshake_mode())
     }
 
     /// 连接到 TDX 服务器
@@ -262,7 +286,7 @@ impl TdxHqClient {
                 let tcp_ms = tcp_start.elapsed().as_secs_f64() * 1000.0;
 
                 let hs_start = Instant::now();
-                utils::perform_handshake(&mut tcp)?;
+                utils::perform_handshake_with_mode(&mut tcp, self.handshake_mode())?;
                 let hs_ms = hs_start.elapsed().as_secs_f64() * 1000.0;
 
                 // 简单 API (get_security_count)
@@ -288,7 +312,7 @@ impl TdxHqClient {
                 Ok((tcp_ms, hs_ms)) => {
                     let api_ms = {
                         let mut conn = TcpConnection::connect(ip, port, timeout_secs).unwrap();
-                        utils::perform_handshake(&mut conn).unwrap();
+                        utils::perform_handshake_with_mode(&mut conn, self.handshake_mode()).unwrap();
                         let start = Instant::now();
                         let mut pkt = Vec::with_capacity(18);
                         pkt.extend_from_slice(&[
@@ -327,7 +351,7 @@ impl TdxHqClient {
 
         // 建立连接并执行握手
         let mut tcp = TcpConnection::connect(ip, port, timeout_secs)?;
-        utils::perform_handshake(&mut tcp)?;
+        self.do_handshake(&mut tcp)?;
 
         // 握手成功，复用现有连接池 (保持心跳线程引用有效)
         let server = (ip.to_string(), port);
@@ -416,6 +440,7 @@ impl TdxHqClient {
         let last_server = Arc::clone(&self.last_server);
         let interval = Duration::from_secs_f64(DEFAULT_HEARTBEAT_INTERVAL);
         let connect_timeout = *self.connect_timeout.lock().unwrap();
+        let handshake_mode = Arc::clone(&self.handshake_mode);
 
         let handle = std::thread::spawn(move || {
             while !stop_clone.load(Ordering::Relaxed) {
@@ -474,7 +499,10 @@ impl TdxHqClient {
                             }
                             match TcpConnection::connect(ip, port, connect_timeout) {
                                 Ok(mut tcp) => {
-                                    if utils::perform_handshake(&mut tcp).is_ok() {
+                                    let mode = utils::HandshakeMode::from_u8(
+                                        handshake_mode.load(Ordering::Relaxed),
+                                    );
+                                    if utils::perform_handshake_with_mode(&mut tcp, mode).is_ok() {
                                         let new_server = (ip.to_string(), port);
                                         pool.push(tcp, new_server.clone());
                                         *last_server.lock().unwrap() = Some(new_server);
@@ -1031,25 +1059,51 @@ impl TdxHqClient {
         for &(_, code) in all_stock {
             self.check_not_block_code(code)?;
         }
-        let stock_len = all_stock.len() as u16;
-        let pkgdatalen = (stock_len as u32) * 7 + 12;
 
-        let mut packet = Vec::with_capacity(26 + stock_len as usize * 7);
-        packet.extend_from_slice(&0x010Cu16.to_le_bytes());
-        packet.extend_from_slice(&0x02006320u32.to_le_bytes());
-        packet.extend_from_slice(&(pkgdatalen as u16).to_le_bytes());
-        packet.extend_from_slice(&(pkgdatalen as u16).to_le_bytes());
-        packet.extend_from_slice(&CMD_SECURITY_QUOTES.to_le_bytes());
-        packet.extend_from_slice(&0u32.to_le_bytes());
-        packet.extend_from_slice(&0u16.to_le_bytes());
-        packet.extend_from_slice(&stock_len.to_le_bytes());
-        for &(market, code) in all_stock {
-            packet.push(market);
-            packet.extend_from_slice(&utils::code_bytes(code));
+        // 空响应自动重试 (某些服务器不支持实时行情)
+        let max_retry = 3;
+        let mut retry_count = 0;
+
+        for attempt in 0..max_retry {
+            let stock_len = all_stock.len() as u16;
+            let pkgdatalen = (stock_len as u32) * 7 + 12;
+
+            let mut packet = Vec::with_capacity(26 + stock_len as usize * 7);
+            packet.extend_from_slice(&0x010Cu16.to_le_bytes());
+            packet.extend_from_slice(&0x02006320u32.to_le_bytes());
+            packet.extend_from_slice(&(pkgdatalen as u16).to_le_bytes());
+            packet.extend_from_slice(&(pkgdatalen as u16).to_le_bytes());
+            packet.extend_from_slice(&CMD_SECURITY_QUOTES.to_le_bytes());
+            packet.extend_from_slice(&0u32.to_le_bytes());
+            packet.extend_from_slice(&0u16.to_le_bytes());
+            packet.extend_from_slice(&stock_len.to_le_bytes());
+            for &(market, code) in all_stock {
+                packet.push(market);
+                packet.extend_from_slice(&utils::code_bytes(code));
+            }
+
+            let body = self.send_and_recv(&packet)?;
+            let quotes = parse_security_quotes(&body)?;
+
+            if !quotes.is_empty() {
+                if retry_count > 0 {
+                    logi!("hq", "got {} quotes after {} server switch(es)", quotes.len(), retry_count);
+                }
+                return Ok(quotes);
+            }
+
+            // 空响应，尝试切换服务器
+            retry_count += 1;
+            logd!("hq", "attempt {}/{}: empty quotes, switching server",
+                  attempt + 1, max_retry);
+
+            if attempt < max_retry - 1 {
+                self.reconnect_to_another_server();
+            }
         }
 
-        let body = self.send_and_recv(&packet)?;
-        parse_security_quotes(&body)
+        logw!("hq", "all {} attempts returned empty quotes", max_retry);
+        Ok(Vec::new())
     }
 
     /// 获取证券列表 (带缓存)

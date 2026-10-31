@@ -1,5 +1,67 @@
 # 变更日志
 
+## v0.6.9 (2026-10-31) — 服务器清单扩充 + 真实K线探测
+
+### 变更
+- **PRIMARY_SERVERS 重选** — 基于 SkipCmd3 真实K线探测 (600519 日K验证)
+  - 背景: 合并其他通达信接口项目的公开服务器清单 (36台候选) 后逐台实测
+  - 结果: 27/36 台在 SkipCmd3 握手下 K线可用 (此前 Full 握手多数被掐行情, Issue #12)
+  - 优先组按探测延迟排序重选 (跨IP段 + 跨运营商)，新增:
+    - 通达信深圳9 (159.75.55.232, 448ms)
+    - MAC专用165 (121.37.207.165, 527ms)
+    - 中信短线宝21 (58.67.221.146, 898ms)
+    - MAC专用136 (123.60.47.136, 1465ms)
+    - 国泰君安13 (117.34.114.20, 1569ms)
+    - 华林6 (218.106.92.183, 1636ms)
+  - 移出优先组: 杭州电信J3 (3383ms) / 华林7 (3729ms)，降入 ALL_KNOWN
+- **ALL_KNOWN_SERVERS 扩充** — 新增 10 台 (来自公开服务器清单)
+  - K线可用 8 台: 中信短线宝22/23、MAC专用138、国泰君安上海 等
+  - 探测不可达 2 台: 国泰君安江苏/深圳 (保留供其他网络环境重试)
+
+### 改进
+- **`TdxSmartClient::probe_and_cache` 升级为真实K线探测** (Issue #12 对齐)
+  - 原实现: 仅验证 TCP + 握手成功即记为可用
+  - 新实现: 连接成功后拉取一根 600519 日K，数据非空才算可用
+  - 握手成功但 K线为空的服务器记为失败并写入缓存 (Issue #12 典型症状)
+  - 探测使用客户端当前握手模式，建议先 `set_handshake_mode("skip_cmd3")`
+
+## v0.6.8 (2026-09-10) — 握手模式 + 服务器列表更新 + 板块K线修复
+
+### 新增
+- **`HandshakeMode` 握手模式枚举** — 解决 Issue #12: SETUP_CMD3 导致服务器拒绝行情数据
+  - 背景: 部分通达信服务器在收到 `SETUP_CMD3` (0x1899) 后，将该包视为"客户端引擎版本上报"，
+    版本不被认可时掐掉整个会话的行情权限，K线/行情/逐笔接口一律返回 2 字节 `0x2003`
+  - 验证: 8台测试服务器中 6台在不发 cmd3 时正常供数 (count=30)，发 cmd3 后全部返回空
+  - 新增模式:
+    - `Full` (默认) — cmd1+cmd2+cmd3，保持向后兼容
+    - `SkipCmd3` — cmd1+cmd2，解决服务器拒绝行情问题
+    - `Cmd1Only` — 仅 cmd1
+    - `None` — 不发送握手命令
+  - Rust API: `client.set_handshake_mode(HandshakeMode::SkipCmd3)`
+  - Python API: `client.set_handshake_mode("skip_cmd3")`
+  - 支持客户端: `TdxHqClient` / `TdxDirectClient` / `AsyncTdxHqClient`
+  - Rust 单元测试: 5 个新增测试覆盖模式切换和命令列表
+
+### 紧急修复
+- **PRIMARY_SERVERS 大规模更新** — 应对通达信服务端策略变更
+  - 背景: 2026-09-10 发现几乎所有公网服务器的K线接口 (CMD=0x052D) 返回空数据
+  - 排查结果: 18台测试服务器中仅安信15、国泰君安9的K线接口正常
+  - 其他接口 (除权除息/分时/证券数量/证券列表) 不受影响
+  - 更新 PRIMARY_SERVERS: 安信15、国泰君安9 提升到优先组前两位
+  - 影响: `TdxHqClient`、`TdxSmartClient`、`TdxBlockClient` 的K线查询均恢复正常
+
+### 修复
+- **CLI 日线/分钟线输出字段对调** — 成交量与成交额标签修正
+  - 日线: d[5] 是成交额、d[6] 是成交量，原代码标签对调
+  - 分钟线: tuple 布局为 (datetime, open, high, low, close, amount, volume, ...)，原代码假设了错误的 7 字段布局导致整体错位
+  - 修复: CLI 输出列名与 tuple 索引正确对应
+- **`TdxBlockClient` 板块K线返回空数据** — 新增空响应自动重试
+  - 问题: 部分服务器 (如海通8、广发13) 握手正常但板块K线返回空数据
+  - 原因: `TdxBlockClient` 使用 `TdxDirectClient` (裸连接)，无自动切换能力
+  - 修复: `get_block_bars` (category >= 4) 和 `get_block_quotes` 返回空数据时，自动遍历 PRIMARY_SERVERS 切换服务器重试
+  - 候选列表: 用户指定服务器 + PRIMARY_SERVERS (去重)，最多重试 5 次
+  - 日志: 切换时 `debug`，成功时 `info`，全部失败时 `warn`
+
 ## v0.6.7 (2026-07-21) — 日K空响应自动重试 + SmartClient + 服务器黑名单
 
 ### 新增
@@ -18,11 +80,19 @@
   - 适用场景: 用户已知某台服务器在当前网络环境下不可用
 
 ### 优化
-- **日K空响应自动重试** — 单台服务器故障不影响数据获取
-  - `get_security_bars` 和 `get_index_bars` (category >= 4) 返回空数据时，自动切换服务器重试
+- **空响应自动重试** — 单台服务器故障不影响数据获取
+  - `get_security_bars`、`get_index_bars` (category >= 4)、`get_security_quotes` 返回空数据时，自动切换服务器重试
   - 最多重试 2 次 (共 3 次请求)，遍历 PRIMARY_SERVERS
-  - 解决部分服务器 (如海通、广发) 握手正常但 K 线返回空的问题
+  - 解决部分服务器 (如海通、广发) 握手正常但 K 线/行情返回空的问题
   - 分钟线 (category < 4) 不重试，避免不必要的开销
+  - **同步版和异步版均已支持** (v0.6.7 修复)
+- **`AsyncTdxHqClient` 空响应重试修复** — 与同步版行为一致
+  - `get_security_bars` 和 `get_index_bars` 新增空响应重试逻辑
+  - 新增 `reconnect_to_another_server()` 方法，跳过当前服务器
+  - 新增 `last_server` 跟踪，避免反复连接同一服务器
+- **`get_security_quotes` 空响应重试** — 实时行情也支持自动切换服务器
+  - 某些服务器不支持实时行情，首次查询返回空时自动切换
+  - 解决"先查K线再查行情正常，直接查行情返回空"的问题
 - **日志级别优化** — 减少重试日志噪音
   - 单次重试尝试: `debug` 级别 (仅 `TDXRS_LOG=debug` 时显示)
   - 重试成功摘要: `info` 级别 (如 `got 5 bars for 600519 after 2 server switch(es)`)

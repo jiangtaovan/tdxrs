@@ -4,6 +4,7 @@ use pyo3::IntoPyObjectExt;
 
 use crate::error::TdxError;
 use crate::net::client::TdxHqClient;
+use crate::net::utils::HandshakeMode;
 
 /// 将 TdxError 转换为 Python 异常 (带错误码)
 fn to_py_err(e: TdxError) -> PyErr {
@@ -72,6 +73,52 @@ impl PyTdxHqClient {
     /// 设置连接超时 (秒)
     fn set_connect_timeout(&self, timeout: f64) {
         self.client.set_connect_timeout(timeout);
+    }
+
+    /// 设置握手模式 (Issue #12)
+    ///
+    /// 可选值:
+    /// - "full"       — 完整三步握手 cmd1+cmd2+cmd3 (默认)
+    /// - "skip_cmd3"  — 跳过 cmd3: cmd1+cmd2 (服务器拒绝行情时使用)
+    /// - "cmd1_only"  — 仅 cmd1
+    /// - "none"       — 不发送握手命令
+    ///
+    /// 背景: 部分通达信服务器在收到 SETUP_CMD3 后会拒绝行情数据 (K线/行情/逐笔返回空)。
+    /// 若遇到此类问题，切换为 "skip_cmd3" 可恢复。
+    ///
+    /// 示例:
+    /// ```python
+    /// client = tdxrs.TdxHqClient()
+    /// client.set_handshake_mode("skip_cmd3")
+    /// client.connect_to_any()
+    /// ```
+    #[pyo3(signature = (mode))]
+    fn set_handshake_mode(&self, mode: &str) -> PyResult<()> {
+        let m = match mode {
+            "full" | "Full" => HandshakeMode::Full,
+            "skip_cmd3" | "SkipCmd3" => HandshakeMode::SkipCmd3,
+            "cmd1_only" | "Cmd1Only" => HandshakeMode::Cmd1Only,
+            "none" | "None" => HandshakeMode::None,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "mode must be one of: 'full', 'skip_cmd3', 'cmd1_only', 'none'"
+                ));
+            }
+        };
+        self.client.set_handshake_mode(m);
+        Ok(())
+    }
+
+    /// 获取当前握手模式
+    ///
+    /// 返回: "full" / "skip_cmd3" / "cmd1_only" / "none"
+    fn handshake_mode(&self) -> &'static str {
+        match self.client.handshake_mode() {
+            HandshakeMode::Full => "full",
+            HandshakeMode::SkipCmd3 => "skip_cmd3",
+            HandshakeMode::Cmd1Only => "cmd1_only",
+            HandshakeMode::None => "none",
+        }
     }
 
     /// 设置默认请求速率限制 (每秒请求数, 0=禁用)

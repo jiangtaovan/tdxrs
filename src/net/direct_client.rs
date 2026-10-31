@@ -24,6 +24,8 @@ pub struct TdxDirectClient {
     timeout: f64,
     /// 复权上下文数据量档位 (默认 Mid ≈ 20 年), 以 u8 存储
     fq_context_tier: AtomicU8,
+    /// 握手模式 (Issue #12)
+    handshake_mode: AtomicU8,
 }
 
 impl TdxDirectClient {
@@ -33,7 +35,18 @@ impl TdxDirectClient {
             port,
             timeout,
             fq_context_tier: AtomicU8::new(utils::FqContextTier::default() as u8),
+            handshake_mode: AtomicU8::new(utils::HandshakeMode::Full as u8),
         }
+    }
+
+    /// 获取当前握手模式
+    pub fn handshake_mode(&self) -> utils::HandshakeMode {
+        utils::HandshakeMode::from_u8(self.handshake_mode.load(Ordering::Relaxed))
+    }
+
+    /// 设置握手模式
+    pub fn set_handshake_mode(&self, mode: utils::HandshakeMode) {
+        self.handshake_mode.store(mode as u8, Ordering::Relaxed);
     }
 
     /// 更新服务器地址
@@ -57,7 +70,7 @@ impl TdxDirectClient {
                 loge!("direct", "connect to {}:{} failed: {}", self.ip, self.port, e);
                 e
             })?;
-        utils::perform_handshake(&mut conn)?;
+        utils::perform_handshake_with_mode(&mut conn, self.handshake_mode())?;
 
         conn.send(packet)?;
 

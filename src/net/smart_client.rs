@@ -5,6 +5,8 @@
 //! - **惰性健康检查**: 首次 K 线请求返回空时触发，自动切换服务器
 //! - **本地缓存**: 记录成功/失败服务器，下次连接优先使用缓存
 //! - **黑名单机制**: 连续失败的服务器自动加入黑名单 (24h 过期)
+//! - **真实 K 线探测** (v0.6.9): `probe_and_cache` 拉取一根日K验证数据，
+//!   握手成功但 K 线为空的服务器记为失败 (Issue #12 对齐)
 //!
 //! ## 使用场景
 //!
@@ -500,6 +502,18 @@ impl TdxSmartClient {
         &self.inner
     }
 
+    /// 设置握手模式 (委托到内部 TdxHqClient)
+    ///
+    /// Issue #12: 若服务器拒绝行情数据，切换为 `HandshakeMode::SkipCmd3`
+    pub fn set_handshake_mode(&self, mode: utils::HandshakeMode) {
+        self.inner.set_handshake_mode(mode);
+    }
+
+    /// 获取当前握手模式
+    pub fn handshake_mode(&self) -> utils::HandshakeMode {
+        self.inner.handshake_mode()
+    }
+
     /// 获取缓存统计
     pub fn cache_stats(&self) -> String {
         let cache = self.cache.lock().unwrap();
@@ -522,6 +536,14 @@ impl TdxSmartClient {
     /// 探测所有服务器并更新缓存
     ///
     /// 类似 mootdx 的 bestip 功能。
+    ///
+    /// **真实 K 线探测** (v0.6.9, Issue #12 对齐):
+    /// 不只验证 TCP + 握手 — 连接成功后再拉取一根 600519 日K，
+    /// 数据非空才算服务器可用。握手成功 ≠ 行情可用 (部分服务器
+    /// 收到 SETUP_CMD3 后会掐掉行情权限，返回 2 字节 0x2003)。
+    ///
+    /// 注意: 探测使用客户端当前握手模式。若目标服务器拒绝行情数据，
+    /// 请先 `set_handshake_mode(HandshakeMode::SkipCmd3)` 再探测。
     pub fn probe_and_cache(&self, timeout_secs: f64) -> Vec<(String, u16, String, u32)> {
         let mut results = Vec::new();
 
@@ -529,15 +551,31 @@ impl TdxSmartClient {
             let start = Instant::now();
             match self.inner.connect(ip, port, Some(timeout_secs)) {
                 Ok(true) => {
+                    // 真实 K 线验证: 拉取一根日K，数据非空才算可用
+                    let bars =
+                        self.inner.get_security_bars(4, 1, "600519", 0, 1, 1);
                     let latency = start.elapsed().as_millis() as u32;
-                    self.cache.lock().unwrap().record_success(ip, port, name, latency);
-                    results.push((ip.to_string(), port, name.to_string(), latency));
-                    logi!("probe", "{}:{} ({}) - {}ms", ip, port, name, latency);
+                    match bars {
+                        Ok(bars) if !bars.is_empty() => {
+                            self.cache.lock().unwrap().record_success(ip, port, name, latency);
+                            results.push((ip.to_string(), port, name.to_string(), latency));
+                            logi!("probe", "{}:{} ({}) - {}ms (kline ok)", ip, port, name, latency);
+                        }
+                        Ok(_) => {
+                            // 握手成功但 K 线为空 — Issue #12 典型症状
+                            self.cache.lock().unwrap().record_failure(ip, port);
+                            logw!("probe", "{}:{} ({}) - handshake ok but empty kline", ip, port, name);
+                        }
+                        Err(e) => {
+                            self.cache.lock().unwrap().record_failure(ip, port);
+                            logw!("probe", "{}:{} ({}) - kline err: {}", ip, port, name, e);
+                        }
+                    }
                     self.inner.disconnect();
                 }
                 _ => {
                     self.cache.lock().unwrap().record_failure(ip, port);
-                    logw!("probe", "{}:{} ({}) - failed", ip, port, name);
+                    logw!("probe", "{}:{} ({}) - connect failed", ip, port, name);
                 }
             }
         }

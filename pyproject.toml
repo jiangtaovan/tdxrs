@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "tdxrs"
-version = "0.6.7"
+version = "0.6.9"
 description = "TDX (通达信) market data parser — Rust implementation with Python bindings"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -16,6 +16,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",

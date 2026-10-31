@@ -26,7 +26,7 @@ use std::io::Read;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 use crate::error::{Result, TdxError};
-use crate::logw;
+use crate::{logd, logi, logw};
 use crate::net::packet::{ResponseHeader, RSP_HEADER_LEN};
 use crate::net::utils::{self, TradingPhase};
 use crate::protocol::constants::*;
@@ -54,8 +54,19 @@ struct ConnectionTask {
 }
 
 impl ConnectionTask {
-    /// 连接到服务器并完成三步握手
+    /// 连接到服务器并完成握手 (默认 Full 模式)
+    #[allow(dead_code)]
     async fn connect(ip: &str, port: u16, timeout_secs: f64) -> Result<Self> {
+        Self::connect_with_mode(ip, port, timeout_secs, utils::HandshakeMode::Full).await
+    }
+
+    /// 连接到服务器并按指定模式完成握手
+    async fn connect_with_mode(
+        ip: &str,
+        port: u16,
+        timeout_secs: f64,
+        mode: utils::HandshakeMode,
+    ) -> Result<Self> {
         let addr = format!("{}:{}", ip, port);
         let stream = tokio::time::timeout(
             Duration::from_secs_f64(timeout_secs),
@@ -70,8 +81,8 @@ impl ConnectionTask {
 
         let mut task = Self { stream };
 
-        // 三步握手
-        for cmd in &[SETUP_CMD1, SETUP_CMD2, SETUP_CMD3] {
+        // 按模式执行握手
+        for cmd in mode.commands() {
             task.send(cmd).await?;
             let head = task.recv(RSP_HEADER_LEN).await?;
             let header = ResponseHeader::parse(&head)?;
@@ -238,8 +249,12 @@ pub struct AsyncTdxHqClient {
     heartbeat_stop: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
     /// 连接是否存活 (心跳检测)
     connected: Arc<std::sync::atomic::AtomicBool>,
+    /// 上次连接的服务器 (用于重连时跳过)
+    last_server: tokio::sync::Mutex<Option<(String, u16)>>,
     /// 复权上下文数据量档位 (默认 Mid ≈ 20 年), 以 u8 存储
     fq_context_tier: AtomicU8,
+    /// 握手模式 (Issue #12)
+    handshake_mode: AtomicU8,
 }
 
 impl AsyncTdxHqClient {
@@ -259,8 +274,20 @@ impl AsyncTdxHqClient {
             pool_size: pool_size.max(1),
             heartbeat_stop: tokio::sync::Mutex::new(None),
             connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_server: tokio::sync::Mutex::new(None),
             fq_context_tier: AtomicU8::new(utils::FqContextTier::default() as u8),
+            handshake_mode: AtomicU8::new(utils::HandshakeMode::Full as u8),
         }
+    }
+
+    /// 获取当前握手模式
+    pub fn handshake_mode(&self) -> utils::HandshakeMode {
+        utils::HandshakeMode::from_u8(self.handshake_mode.load(Ordering::Relaxed))
+    }
+
+    /// 设置握手模式
+    pub fn set_handshake_mode(&self, mode: utils::HandshakeMode) {
+        self.handshake_mode.store(mode as u8, Ordering::Relaxed);
     }
 
     /// 连接到指定服务器 (建立 N 个连接)
@@ -272,7 +299,9 @@ impl AsyncTdxHqClient {
         conns.clear();
 
         for _ in 0..self.pool_size {
-            let task = ConnectionTask::connect(ip, port, timeout_secs).await?;
+            let task = ConnectionTask::connect_with_mode(
+                ip, port, timeout_secs, self.handshake_mode(),
+            ).await?;
             let (tx, rx) = mpsc::channel::<Request>(64);
             tokio::spawn(task.run(rx));
             conns.push(ConnectionHandle { tx });
@@ -281,6 +310,9 @@ impl AsyncTdxHqClient {
         self.count_cache.lock().await.clear();
         self.list_cache.lock().await.clear();
         drop(conns);
+
+        // 记录当前服务器
+        *self.last_server.lock().await = Some((ip.to_string(), port));
 
         // 启动心跳
         self.start_heartbeat().await;
@@ -337,6 +369,32 @@ impl AsyncTdxHqClient {
     /// 连接是否存活
     pub fn is_connected(&self) -> bool {
         self.connected.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 尝试切换到另一台服务器
+    ///
+    /// 遍历 PRIMARY_SERVERS，跳过当前服务器，连接到第一台可用的。
+    async fn reconnect_to_another_server(&self) {
+        let current = self.last_server.lock().await.clone();
+
+        for &(_, ip, port) in PRIMARY_SERVERS {
+            // 跳过当前服务器
+            if let Some((ref cur_ip, cur_port)) = current {
+                if ip == cur_ip.as_str() && port == cur_port {
+                    continue;
+                }
+            }
+
+            match self.connect(ip, port, Some(CONNECT_TIMEOUT)).await {
+                Ok(true) => {
+                    logi!("async", "switched to server {}:{}", ip, port);
+                    return;
+                }
+                _ => continue,
+            }
+        }
+
+        logw!("async", "no alternative server available");
     }
 
     // ================================================================
@@ -587,10 +645,39 @@ impl AsyncTdxHqClient {
         count: u16,
         fq: u8,
     ) -> Result<Vec<SecurityBar>> {
-        let packet = utils::build_security_bars_packet(category, market, code, start, count, fq);
-        let body = self.send_and_recv(&packet).await?;
-        let mut bars = parse_security_bars(&body, category)?;
-        if fq != 0 {
+        // 日K线空响应自动重试 (与同步版一致)
+        let should_retry_empty = category >= 4;
+        let max_retry = if should_retry_empty { 3 } else { 1 };
+
+        let mut bars = Vec::new();
+        let mut retry_count = 0;
+
+        for attempt in 0..max_retry {
+            let packet = utils::build_security_bars_packet(category, market, code, start, count, fq);
+            let body = self.send_and_recv(&packet).await?;
+            let parsed = parse_security_bars(&body, category)?;
+
+            if !parsed.is_empty() || !should_retry_empty {
+                bars = parsed;
+                break;
+            }
+
+            retry_count += 1;
+            logd!("async", "attempt {}/{}: empty K-line for {}, switching server",
+                  attempt + 1, max_retry, code);
+
+            if attempt < max_retry - 1 {
+                self.reconnect_to_another_server().await;
+            }
+        }
+
+        if bars.is_empty() && should_retry_empty && retry_count > 0 {
+            logw!("async", "all {} attempts returned empty K-line for {}", max_retry, code);
+        } else if retry_count > 0 && !bars.is_empty() {
+            logi!("async", "got {} bars for {} after {} server switch(es)", bars.len(), code, retry_count);
+        }
+
+        if fq != 0 && !bars.is_empty() {
             if let Ok(xdxr) = self.get_xdxr_info(market, code).await {
                 use crate::protocol::adjuster::{adjust_security_bars, FqType};
                 let fq_enum = if fq == 2 { FqType::Hfq } else { FqType::Qfq };
@@ -647,9 +734,40 @@ impl AsyncTdxHqClient {
         fq: u8,
     ) -> Result<Vec<IndexBar>> {
         let _ = fq;
-        let packet = utils::build_index_bars_packet(category, market, code, start, count, 0);
-        let body = self.send_and_recv(&packet).await?;
-        parse_index_bars(&body, category)
+
+        // 日K线空响应自动重试 (与同步版一致)
+        let should_retry_empty = category >= 4;
+        let max_retry = if should_retry_empty { 3 } else { 1 };
+
+        let mut bars = Vec::new();
+        let mut retry_count = 0;
+
+        for attempt in 0..max_retry {
+            let packet = utils::build_index_bars_packet(category, market, code, start, count, 0);
+            let body = self.send_and_recv(&packet).await?;
+            let parsed = parse_index_bars(&body, category)?;
+
+            if !parsed.is_empty() || !should_retry_empty {
+                bars = parsed;
+                break;
+            }
+
+            retry_count += 1;
+            logd!("async", "attempt {}/{}: empty index K-line for {}, switching server",
+                  attempt + 1, max_retry, code);
+
+            if attempt < max_retry - 1 {
+                self.reconnect_to_another_server().await;
+            }
+        }
+
+        if bars.is_empty() && should_retry_empty && retry_count > 0 {
+            logw!("async", "all {} attempts returned empty index K-line for {}", max_retry, code);
+        } else if retry_count > 0 && !bars.is_empty() {
+            logi!("async", "got {} index bars for {} after {} server switch(es)", bars.len(), code, retry_count);
+        }
+
+        Ok(bars)
     }
 
     /// 获取实时行情 (批量)
@@ -667,25 +785,51 @@ impl AsyncTdxHqClient {
         } else {
             all_stock
         };
-        let stock_len = all_stock.len() as u16;
-        let pkgdatalen = (stock_len as u32) * 7 + 12;
 
-        let mut packet = Vec::with_capacity(26 + stock_len as usize * 7);
-        packet.extend_from_slice(&0x010Cu16.to_le_bytes());
-        packet.extend_from_slice(&0x02006320u32.to_le_bytes());
-        packet.extend_from_slice(&(pkgdatalen as u16).to_le_bytes());
-        packet.extend_from_slice(&(pkgdatalen as u16).to_le_bytes());
-        packet.extend_from_slice(&CMD_SECURITY_QUOTES.to_le_bytes());
-        packet.extend_from_slice(&0u32.to_le_bytes());
-        packet.extend_from_slice(&0u16.to_le_bytes());
-        packet.extend_from_slice(&stock_len.to_le_bytes());
-        for &(market, code) in all_stock {
-            packet.push(market);
-            packet.extend_from_slice(&utils::code_bytes(code));
+        // 空响应自动重试 (某些服务器不支持实时行情)
+        let max_retry = 3;
+        let mut retry_count = 0;
+
+        for attempt in 0..max_retry {
+            let stock_len = all_stock.len() as u16;
+            let pkgdatalen = (stock_len as u32) * 7 + 12;
+
+            let mut packet = Vec::with_capacity(26 + stock_len as usize * 7);
+            packet.extend_from_slice(&0x010Cu16.to_le_bytes());
+            packet.extend_from_slice(&0x02006320u32.to_le_bytes());
+            packet.extend_from_slice(&(pkgdatalen as u16).to_le_bytes());
+            packet.extend_from_slice(&(pkgdatalen as u16).to_le_bytes());
+            packet.extend_from_slice(&CMD_SECURITY_QUOTES.to_le_bytes());
+            packet.extend_from_slice(&0u32.to_le_bytes());
+            packet.extend_from_slice(&0u16.to_le_bytes());
+            packet.extend_from_slice(&stock_len.to_le_bytes());
+            for &(market, code) in all_stock {
+                packet.push(market);
+                packet.extend_from_slice(&utils::code_bytes(code));
+            }
+
+            let body = self.send_and_recv(&packet).await?;
+            let quotes = parse_security_quotes(&body)?;
+
+            if !quotes.is_empty() {
+                if retry_count > 0 {
+                    logi!("async", "got {} quotes after {} server switch(es)", quotes.len(), retry_count);
+                }
+                return Ok(quotes);
+            }
+
+            // 空响应，尝试切换服务器
+            retry_count += 1;
+            logd!("async", "attempt {}/{}: empty quotes, switching server",
+                  attempt + 1, max_retry);
+
+            if attempt < max_retry - 1 {
+                self.reconnect_to_another_server().await;
+            }
         }
 
-        let body = self.send_and_recv(&packet).await?;
-        parse_security_quotes(&body)
+        logw!("async", "all {} attempts returned empty quotes", max_retry);
+        Ok(Vec::new())
     }
 
     /// 获取证券列表

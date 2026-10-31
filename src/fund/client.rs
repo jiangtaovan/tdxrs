@@ -66,6 +66,18 @@ impl TdxHqFundClient {
         self.inner.is_connected()
     }
 
+    /// 设置握手模式 (委托到内部 TdxHqClient)
+    ///
+    /// Issue #12: 若服务器拒绝行情数据，切换为 `HandshakeMode::SkipCmd3`
+    pub fn set_handshake_mode(&self, mode: crate::net::utils::HandshakeMode) {
+        self.inner.set_handshake_mode(mode);
+    }
+
+    /// 获取当前握手模式
+    pub fn handshake_mode(&self) -> crate::net::utils::HandshakeMode {
+        self.inner.handshake_mode()
+    }
+
     /// 获取基金列表
     ///
     /// 从证券列表中筛选出基金，返回基金基本信息列表。
