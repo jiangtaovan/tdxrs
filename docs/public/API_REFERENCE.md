@@ -221,20 +221,22 @@ TDXRS_LOG=debug python your_script.py
 | `set_rate_limit(rps: int)` | 默认限流 (req/s)，0=禁用，默认 50，上限 200 |
 | `set_rate_limit_daily(rps: int)` | 日K 限流 (req/s)，0=禁用，默认 15，上限 200 |
 | `rate_limit_minute()` → `int` | 分时限流 (固定 10 req/s，不可修改) |
-| `set_handshake_mode(mode: str)` | 握手模式: `"full"`(默认) / `"skip_cmd3"` / `"cmd1_only"` / `"none"` |
+| `set_handshake_mode(mode: str)` | 握手模式: `"skip_cmd3"`(默认) / `"full"` / `"cmd1_only"` / `"none"` |
 | `handshake_mode()` → `str` | 获取当前握手模式 |
 | `pool_stats()` → `{"idle": int, "active": int, "total": int, "max_size": int}` | 连接池状态 |
 
-**握手模式说明** (Issue #12):
+**握手模式说明** (Issue #15):
 
-部分通达信服务器在收到 `SETUP_CMD3` (0x1899) 后会拒绝行情数据 (K线/行情/逐笔返回空)。
-若遇到此类问题，切换为 `"skip_cmd3"` 模式可恢复:
+默认 `"skip_cmd3"` (仅发 cmd1+cmd2)。多数通达信服务器把 `SETUP_CMD3` (0x1899) 当作
+"客户端引擎版本上报"，版本不被认可即掐掉行情权限 (K线/行情/逐笔返回空或 `0x2003`)。
+A/B 实测 (46台) 显示 Full 供数 2/72、SkipCmd3 供数 54/72，故默认取 SkipCmd3。
+
+仅当遇到要求 cmd3 的服务器时才需显式回退:
 
 ```python
 client = tdxrs.TdxHqClient()
-client.set_handshake_mode("skip_cmd3")  # 跳过 cmd3，仅发 cmd1+cmd2
+client.set_handshake_mode("full")  # 仅当服务器要求 cmd3 时
 client.connect_to_any()
-bars = client.get_security_bars(4, 1, "600519", 0, 100, 0)  # 正常返回数据
 ```
 
 所有客户端均支持 `set_handshake_mode()`:
@@ -886,10 +888,7 @@ from tdxrs import TdxSmartClient
 # 创建智能客户端
 client = TdxSmartClient()
 
-# Issue #12: 服务器拒绝行情时切换为 SkipCmd3 (cmd1+cmd2 握手)
-client.set_handshake_mode("skip_cmd3")
-
-# 连接 (自动使用缓存，跳过黑名单服务器)
+# 连接 (自动使用缓存，跳过黑名单服务器; 默认已用 SkipCmd3 握手)
 client.connect_to_any(timeout=10.0)
 
 # 获取 K 线数据 (如果返回空，自动切换服务器重试)

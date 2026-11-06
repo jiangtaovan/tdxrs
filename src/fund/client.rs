@@ -68,7 +68,7 @@ impl TdxHqFundClient {
 
     /// 设置握手模式 (委托到内部 TdxHqClient)
     ///
-    /// Issue #12: 若服务器拒绝行情数据，切换为 `HandshakeMode::SkipCmd3`
+    /// Issue #15: 若服务器拒绝行情数据，切换为 `HandshakeMode::SkipCmd3`
     pub fn set_handshake_mode(&self, mode: crate::net::utils::HandshakeMode) {
         self.inner.set_handshake_mode(mode);
     }

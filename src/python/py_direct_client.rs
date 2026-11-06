@@ -55,7 +55,7 @@ impl PyTdxDirectClient {
         self.client.lock().unwrap().set_timeout(timeout);
     }
 
-    /// 设置握手模式 (Issue #12)
+    /// 设置握手模式 (Issue #15)
     ///
     /// 可选值: "full" / "skip_cmd3" / "cmd1_only" / "none"
     #[pyo3(signature = (mode))]

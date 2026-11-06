@@ -40,7 +40,7 @@ pub struct TdxF10Client {
     ip: String,
     port: u16,
     timeout: f64,
-    /// 握手模式 (Issue #12)
+    /// 握手模式 (Issue #15)
     handshake_mode: AtomicU8,
 }
 
@@ -56,7 +56,7 @@ impl TdxF10Client {
             ip: ip.to_string(),
             port,
             timeout: timeout.unwrap_or(DEFAULT_F10_TIMEOUT),
-            handshake_mode: AtomicU8::new(utils::HandshakeMode::Full as u8),
+            handshake_mode: AtomicU8::new(utils::HandshakeMode::default() as u8),
         }
     }
 

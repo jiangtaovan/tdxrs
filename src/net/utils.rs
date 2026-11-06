@@ -56,22 +56,26 @@ impl Default for FqContextTier {
 ///
 /// 控制连接建立时发送哪些握手命令。
 ///
-/// 背景 (Issue #12): 部分通达信服务器在收到 `SETUP_CMD3` (0x1899) 后，
+/// 背景 (Issue #15): 部分通达信服务器在收到 `SETUP_CMD3` (0x1899) 后，
 /// 会将该包视为"客户端引擎版本上报"，版本不被认可时掐掉整个会话的行情权限，
 /// 此后 K线/行情/逐笔接口一律返回 2 字节 `0x2003`。
 /// 污染在连接内不可逆，只有新建连接且不发 cmd3 才能恢复。
 ///
 /// | 模式 | 发送命令 | 适用场景 |
 /// |------|---------|---------|
-/// | `Full` | cmd1 + cmd2 + cmd3 | 默认，兼容旧行为 |
-/// | `SkipCmd3` | cmd1 + cmd2 | 服务器拒绝行情时使用 |
+/// | `SkipCmd3` | cmd1 + cmd2 | **默认**，最大化行情可用率 (Issue #15) |
+/// | `Full` | cmd1 + cmd2 + cmd3 | 仅当服务器要求 cmd3 时使用 |
 /// | `Cmd1Only` | 仅 cmd1 | 最小握手 |
 /// | `None` | 不发送 | 已由外部完成握手 |
+///
+/// **为何默认 `SkipCmd3`**: 2026-10-31 A/B 实测 (46 台 × 日K/实时行情)，
+/// Full 供数 2/72、SkipCmd3 供数 54/72，且**无**"Full 可用而 SkipCmd3 不可用"的反例。
+/// cmd3 (0x1899) 被多数服务器当作"引擎版本上报"，不认可即掐行情。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeMode {
-    /// 完整三步握手: cmd1 + cmd2 + cmd3 (默认)
+    /// 完整三步握手: cmd1 + cmd2 + cmd3
     Full = 0,
-    /// 跳过 cmd3: cmd1 + cmd2 (解决 Issue #12)
+    /// 跳过 cmd3: cmd1 + cmd2 (**默认**，解决 Issue #15)
     SkipCmd3 = 1,
     /// 仅 cmd1
     Cmd1Only = 2,
@@ -97,14 +101,14 @@ impl HandshakeMode {
             1 => HandshakeMode::SkipCmd3,
             2 => HandshakeMode::Cmd1Only,
             3 => HandshakeMode::None,
-            _ => HandshakeMode::Full,
+            _ => HandshakeMode::SkipCmd3,
         }
     }
 }
 
 impl Default for HandshakeMode {
     fn default() -> Self {
-        HandshakeMode::Full
+        HandshakeMode::SkipCmd3
     }
 }
 
@@ -413,10 +417,10 @@ pub fn build_index_bars_packet(
 
 /// 执行 TDX 握手协议 (同步)
 ///
-/// 默认使用 `HandshakeMode::Full` (cmd1 + cmd2 + cmd3)，保持向后兼容。
-/// 如需跳过 cmd3，使用 `perform_handshake_with_mode`。
+/// 使用默认握手模式 (`HandshakeMode::SkipCmd3`，见 Issue #15)。
+/// 如需指定模式，使用 `perform_handshake_with_mode`。
 pub fn perform_handshake(conn: &mut TcpConnection) -> Result<()> {
-    perform_handshake_with_mode(conn, HandshakeMode::Full)
+    perform_handshake_with_mode(conn, HandshakeMode::default())
 }
 
 /// 按指定模式执行 TDX 握手协议 (同步)
@@ -562,7 +566,7 @@ mod tests {
 
     #[test]
     fn test_handshake_mode_default() {
-        assert_eq!(HandshakeMode::default(), HandshakeMode::Full);
+        assert_eq!(HandshakeMode::default(), HandshakeMode::SkipCmd3);
     }
 
     #[test]
@@ -600,8 +604,8 @@ mod tests {
         assert_eq!(HandshakeMode::from_u8(1), HandshakeMode::SkipCmd3);
         assert_eq!(HandshakeMode::from_u8(2), HandshakeMode::Cmd1Only);
         assert_eq!(HandshakeMode::from_u8(3), HandshakeMode::None);
-        // 无效值回退到 Full
-        assert_eq!(HandshakeMode::from_u8(99), HandshakeMode::Full);
+        // 无效值回退到默认 (SkipCmd3)
+        assert_eq!(HandshakeMode::from_u8(99), HandshakeMode::SkipCmd3);
     }
 
     #[test]

@@ -75,7 +75,7 @@ impl PyTdxHqClient {
         self.client.set_connect_timeout(timeout);
     }
 
-    /// 设置握手模式 (Issue #12)
+    /// 设置握手模式 (Issue #15)
     ///
     /// 可选值:
     /// - "full"       — 完整三步握手 cmd1+cmd2+cmd3 (默认)

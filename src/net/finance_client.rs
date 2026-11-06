@@ -51,7 +51,7 @@ pub struct TdxFinanceClient {
     port: u16,
     timeout: f64,
     cache_dir: Option<PathBuf>,
-    /// 握手模式 (Issue #12)
+    /// 握手模式 (Issue #15)
     handshake_mode: AtomicU8,
 }
 
@@ -62,7 +62,7 @@ impl TdxFinanceClient {
             port,
             timeout: timeout.unwrap_or(DEFAULT_FINANCE_TIMEOUT),
             cache_dir: None,
-            handshake_mode: AtomicU8::new(utils::HandshakeMode::Full as u8),
+            handshake_mode: AtomicU8::new(utils::HandshakeMode::default() as u8),
         }
     }
 

@@ -20,13 +20,14 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           # 从 CHANGELOG.md 提取当前版本的说明 (匹配 "## vX.Y.Z" 到下一个 "## " 之间)
-          NOTES=$(sed -n "/^## v${VERSION}/,/^## v/{/^## v${VERSION}/p;/^## v/!p;}" docs/public/CHANGELOG.md | tail -n +2 | head -n -1)
-          # 如果没有匹配到，使用默认说明
+          # [^0-9] 防止前缀误匹配 (如 v0.6.1 匹配到 v0.6.10 段落)
+          NOTES=$(sed -n "/^## v${VERSION}[^0-9]/,/^## v/{/^## v${VERSION}[^0-9]/p;/^## v/!p;}" docs/public/CHANGELOG.md | tail -n +2 | head -n -1)
+          # 如果没有匹配到，使用默认说明 (printf 解释 \n, echo 会输出字面量)
           if [ -z "$NOTES" ]; then
-            NOTES="Release v${VERSION}\n\nSee [CHANGELOG](docs/public/CHANGELOG.md) for details."
+            printf 'Release v%s\n\nSee [CHANGELOG](docs/public/CHANGELOG.md) for details.\n' "$VERSION" > /tmp/release_notes.md
+          else
+            printf '%s\n' "$NOTES" > /tmp/release_notes.md
           fi
-          # 写入文件 (避免多行变量问题)
-          echo "$NOTES" > /tmp/release_notes.md
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -39,6 +40,8 @@ jobs:
   # ── 多平台构建 + 发布到 PyPI ──
   linux:
     needs: release
+    permissions:
+      contents: write
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -62,8 +65,15 @@ jobs:
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+      - name: Attach wheels to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
 
   macos:
+    needs: release
+    permissions:
+      contents: write
     runs-on: macos-latest
     strategy:
       matrix:
@@ -83,8 +93,15 @@ jobs:
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+      - name: Attach wheels to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
 
   windows:
+    needs: release
+    permissions:
+      contents: write
     runs-on: windows-latest
     strategy:
       matrix:
@@ -104,3 +121,7 @@ jobs:
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+      - name: Attach wheels to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

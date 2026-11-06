@@ -47,13 +47,13 @@ pub struct TdxHqClient {
     rate_limiter_minute: RateLimiter,
     /// 复权上下文数据量档位 (默认 Mid ≈ 20 年), 以 u8 存储
     fq_context_tier: AtomicU8,
-    /// 握手模式 (Issue #12: Full=三步, SkipCmd3=跳过 cmd3), 以 u8 存储
+    /// 握手模式 (Issue #15: Full=三步, SkipCmd3=跳过 cmd3), 以 u8 存储
     handshake_mode: Arc<AtomicU8>,
 }
 
 impl TdxHqClient {
     pub fn new() -> Self {
-        let handshake_mode = Arc::new(AtomicU8::new(utils::HandshakeMode::Full as u8));
+        let handshake_mode = Arc::new(AtomicU8::new(utils::HandshakeMode::default() as u8));
         let mode_for_closure = handshake_mode.clone();
         let mut config = PoolConfig::default();
         // 设置握手回调，让连接池自动为新连接执行握手
@@ -104,8 +104,8 @@ impl TdxHqClient {
 
     /// 设置握手模式
     ///
-    /// 默认 `HandshakeMode::Full`。若服务器拒绝行情数据 (返回空/K线异常)，
-    /// 可切换为 `HandshakeMode::SkipCmd3` 跳过 SETUP_CMD3。
+    /// 默认 `HandshakeMode::SkipCmd3` (Issue #15: 多数服务器拒绝 cmd3)。
+    /// 若遇到要求 cmd3 的服务器，可切换为 `HandshakeMode::Full`。
     pub fn set_handshake_mode(&self, mode: utils::HandshakeMode) {
         self.handshake_mode.store(mode as u8, Ordering::Relaxed);
     }

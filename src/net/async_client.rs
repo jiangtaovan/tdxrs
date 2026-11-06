@@ -54,10 +54,10 @@ struct ConnectionTask {
 }
 
 impl ConnectionTask {
-    /// 连接到服务器并完成握手 (默认 Full 模式)
+    /// 连接到服务器并完成握手 (默认 SkipCmd3 模式, Issue #15)
     #[allow(dead_code)]
     async fn connect(ip: &str, port: u16, timeout_secs: f64) -> Result<Self> {
-        Self::connect_with_mode(ip, port, timeout_secs, utils::HandshakeMode::Full).await
+        Self::connect_with_mode(ip, port, timeout_secs, utils::HandshakeMode::default()).await
     }
 
     /// 连接到服务器并按指定模式完成握手
@@ -253,7 +253,7 @@ pub struct AsyncTdxHqClient {
     last_server: tokio::sync::Mutex<Option<(String, u16)>>,
     /// 复权上下文数据量档位 (默认 Mid ≈ 20 年), 以 u8 存储
     fq_context_tier: AtomicU8,
-    /// 握手模式 (Issue #12)
+    /// 握手模式 (Issue #15)
     handshake_mode: AtomicU8,
 }
 
@@ -276,7 +276,7 @@ impl AsyncTdxHqClient {
             connected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_server: tokio::sync::Mutex::new(None),
             fq_context_tier: AtomicU8::new(utils::FqContextTier::default() as u8),
-            handshake_mode: AtomicU8::new(utils::HandshakeMode::Full as u8),
+            handshake_mode: AtomicU8::new(utils::HandshakeMode::default() as u8),
         }
     }
 

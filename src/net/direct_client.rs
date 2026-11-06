@@ -24,7 +24,7 @@ pub struct TdxDirectClient {
     timeout: f64,
     /// 复权上下文数据量档位 (默认 Mid ≈ 20 年), 以 u8 存储
     fq_context_tier: AtomicU8,
-    /// 握手模式 (Issue #12)
+    /// 握手模式 (Issue #15)
     handshake_mode: AtomicU8,
 }
 
@@ -35,7 +35,7 @@ impl TdxDirectClient {
             port,
             timeout,
             fq_context_tier: AtomicU8::new(utils::FqContextTier::default() as u8),
-            handshake_mode: AtomicU8::new(utils::HandshakeMode::Full as u8),
+            handshake_mode: AtomicU8::new(utils::HandshakeMode::default() as u8),
         }
     }
 
