@@ -1215,6 +1215,40 @@ impl TdxHqClient {
         parse_history_minute_time_data(&body, market, code)
     }
 
+    /// 获取集合竞价逐笔（09:15~09:25）
+    ///
+    /// 返回按时间升序的撮合快照，每条含 参考价 / 已匹配量 / 未匹配量 / 买卖方向。
+    /// 集合竞价在 09:25 结束后，本接口仍能取到当天全过程的记录。
+    pub fn get_call_auction(
+        &self,
+        market: u8,
+        code: &str,
+    ) -> Result<Vec<CallAuctionTick>> {
+        let code_buf = utils::code_bytes(code);
+        // data = market(1) + 0(1) + code(6) + 20 字节固定参数 = 28
+        let data_len: u16 = 30; // len 字段 = data + 2
+        let mut packet = Vec::with_capacity(12 + 28);
+        packet.extend_from_slice(&[
+            0x0c, 0x01, 0x30, 0x00, 0x01, 0x01, // 帧头
+            (data_len & 0xff) as u8, (data_len >> 8) as u8,
+            (data_len & 0xff) as u8, (data_len >> 8) as u8,
+            0x6a, 0x05, // CMD_CALL_AUCTION
+        ]);
+        packet.push(market);
+        packet.push(0x00);
+        packet.extend_from_slice(&code_buf);
+        packet.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x00, // 起始序号/保留
+            0x03, 0x00, 0x00, 0x00, // 固定 3
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0xf4, 0x01, 0x00, 0x00, // 500
+        ]);
+
+        let body = self.send_and_recv_limited(&packet, &self.rate_limiter_minute)?;
+        parse_call_auction(&body)
+    }
+
     /// 获取逐笔成交
     pub fn get_transaction_data(
         &self,

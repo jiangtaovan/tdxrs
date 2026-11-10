@@ -520,6 +520,34 @@ impl PyTdxHqClient {
         Ok(list.into())
     }
 
+    /// 获取集合竞价逐笔（09:15~09:25）
+    ///
+    /// 返回 list[dict]：time / price / match_vol / unmatched_vol / side
+    /// side=1 表示买方未匹配（买盘排队），-1 表示卖方未匹配。
+    fn get_call_auction(
+        &self,
+        py: Python<'_>,
+        market: u8,
+        code: &str,
+    ) -> PyResult<Py<PyAny>> {
+        let data = self
+            .client
+            .get_call_auction(market, code)
+            .map_err(to_py_err)?;
+
+        let list = PyList::empty(py);
+        for d in &data {
+            let dict = PyDict::new(py);
+            dict.set_item("time", &d.time)?;
+            dict.set_item("price", d.price)?;
+            dict.set_item("match_vol", d.match_vol)?;
+            dict.set_item("unmatched_vol", d.unmatched_vol)?;
+            dict.set_item("side", d.side)?;
+            list.append(dict)?;
+        }
+        Ok(list.into())
+    }
+
     /// 获取逐笔成交
     #[pyo3(signature = (market, code, start=0, count=2000))]
     fn get_transaction_data(
