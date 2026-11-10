@@ -8,6 +8,54 @@ use crate::helpers::{get_price, get_volume};
 use super::types::*;
 
 // ============================================================
+// 集合竞价 (0x056a)
+// ============================================================
+
+/// 解析集合竞价逐笔。
+///
+/// body 布局：`count(u16)` + count × 16 字节
+/// `分钟数(u16) | 价格(f32) | 已匹配量(u32) | 未匹配量(i32) | 秒(u8) | 保留(u8)`
+///
+/// 未匹配量是有符号的：正=买方排队，负=卖方排队。早期实现只读低 16 位，
+/// 未匹配量超过 32767 手时会被截断甚至反向，这里按完整 4 字节读。
+pub fn parse_call_auction(body: &[u8]) -> Result<Vec<CallAuctionTick>> {
+    if body.len() < 2 {
+        return Err(ErrorCode::RESPONSE_LENGTH_MISMATCH.err("body too short for call auction"));
+    }
+
+    let count = read_u16(body, 0) as usize;
+    let mut pos = 2;
+    let mut result = Vec::with_capacity(count);
+
+    for _ in 0..count {
+        if pos + 16 > body.len() {
+            break;
+        }
+        let minutes = read_u16(body, pos) as u32;
+        let price = f32::from_le_bytes([body[pos + 2], body[pos + 3], body[pos + 4], body[pos + 5]]) as f64;
+        let match_vol = read_u32(body, pos + 6) as u64;
+        let unmatched_raw = i32::from_le_bytes([
+            body[pos + 10],
+            body[pos + 11],
+            body[pos + 12],
+            body[pos + 13],
+        ]);
+        let second = body[pos + 14];
+
+        result.push(CallAuctionTick {
+            time: format!("{:02}:{:02}:{:02}", minutes / 60, minutes % 60, second),
+            price: (price * 1000.0).round() / 1000.0,
+            match_vol,
+            unmatched_vol: unmatched_raw.unsigned_abs(),
+            side: if unmatched_raw < 0 { -1 } else { 1 },
+        });
+        pos += 16;
+    }
+
+    Ok(result)
+}
+
+// ============================================================
 // 解析证券数量
 // ============================================================
 
@@ -1303,5 +1351,70 @@ mod tests {
         let result = parse_block_info(&data).unwrap();
         assert_eq!(result.len(), 10);
         assert!(result.iter().all(|&b| b == 0x42));
+    }
+
+    // --- parse_call_auction ---
+
+    fn call_auction_record(minutes: u16, price: f32, matched: u32, unmatched: i32, second: u8) -> Vec<u8> {
+        let mut rec = Vec::with_capacity(16);
+        rec.extend_from_slice(&minutes.to_le_bytes());
+        rec.extend_from_slice(&price.to_le_bytes());
+        rec.extend_from_slice(&matched.to_le_bytes());
+        rec.extend_from_slice(&unmatched.to_le_bytes());
+        rec.push(second);
+        rec.push(0);
+        rec
+    }
+
+    #[test]
+    fn test_call_auction_empty() {
+        assert!(parse_call_auction(&[]).is_err());
+        assert!(parse_call_auction(&[0x00]).is_err());
+    }
+
+    #[test]
+    fn test_call_auction_zero_count() {
+        let rows = parse_call_auction(&[0x00, 0x00]).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_call_auction_two_ticks() {
+        let mut body = vec![0x02, 0x00];
+        body.extend(call_auction_record(9 * 60 + 15, 10.03, 100, 62, 0));
+        body.extend(call_auction_record(9 * 60 + 25, 10.06, 3866, -293, 3));
+
+        let rows = parse_call_auction(&body).unwrap();
+        assert_eq!(rows.len(), 2);
+
+        assert_eq!(rows[0].time, "09:15:00");
+        assert!((rows[0].price - 10.03).abs() < 1e-6);
+        assert_eq!(rows[0].match_vol, 100);
+        assert_eq!(rows[0].unmatched_vol, 62);
+        assert_eq!(rows[0].side, 1);
+
+        assert_eq!(rows[1].time, "09:25:03");
+        // 负数未匹配 → 卖方排队，量取绝对值
+        assert_eq!(rows[1].side, -1);
+        assert_eq!(rows[1].unmatched_vol, 293);
+    }
+
+    #[test]
+    fn test_call_auction_large_unmatched_keeps_sign() {
+        // 109912 手 = 0x0001AD58，低 16 位会被读成负数，必须整 4 字节读
+        let mut body = vec![0x01, 0x00];
+        body.extend(call_auction_record(9 * 60 + 20, 9.55, 5000, 109_912, 12));
+        let rows = parse_call_auction(&body).unwrap();
+        assert_eq!(rows[0].side, 1);
+        assert_eq!(rows[0].unmatched_vol, 109_912);
+    }
+
+    #[test]
+    fn test_call_auction_truncated_record() {
+        let mut body = vec![0x02, 0x00];
+        body.extend(call_auction_record(9 * 60 + 15, 10.03, 100, 62, 0));
+        body.extend_from_slice(&[0u8; 5]); // 第二条只有半截
+        let rows = parse_call_auction(&body).unwrap();
+        assert_eq!(rows.len(), 1);
     }
 }

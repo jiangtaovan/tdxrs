@@ -485,6 +485,9 @@ page2 = client.get_security_list(MARKET_SZ, start=1000)
 get_minute_time_data(market, code) -> list[dict]             # 当日
 get_history_minute_time_data(market, code, date) -> list[dict]  # 历史
 
+# 集合竞价（09:15~09:25 开盘竞价 + 14:57~15:00 收盘竞价，按时间升序）
+get_call_auction(market, code) -> list[dict]   # time / price / match_vol / unmatched_vol / side
+
 # 逐笔成交
 get_transaction_data(market, code, start=0, count=2000) -> list[dict]             # 当日
 get_history_transaction_data(market, code, start, count, date) -> list[dict]    # 历史
@@ -712,6 +715,7 @@ API 签名与 TdxHqClient 完全一致，支持三种输出格式:
 | `get_security_list(market, start)` | `list[dict]` | 证券列表 |
 | `get_minute_time_data(market, code)` | `list[dict]` | 分时数据 |
 | `get_history_minute_time_data(market, code, date)` | `list[dict]` | 历史分时 |
+| `get_call_auction(market, code)` | `list[dict]` | 集合竞价逐笔（开盘 09:15-09:25 + 收盘 14:57-15:00） |
 | `get_transaction_data(market, code, start, count)` | `list[dict]` | 逐笔成交 |
 | `get_history_transaction_data(market, code, start, count, date)` | `list[dict]` | 历史逐笔 |
 | `get_finance_info(market, code)` | `dict` | 财务信息 |

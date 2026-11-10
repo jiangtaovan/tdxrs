@@ -50,6 +50,9 @@ pub const CMD_SECURITY_COUNT: u16 = 0x044E;
 /// 分时数据
 pub const CMD_MINUTE_TIME_DATA: u16 = 0x051D;
 
+/// 集合竞价逐笔 (09:15~09:25)
+pub const CMD_CALL_AUCTION: u16 = 0x056A;
+
 /// 历史分时数据
 pub const CMD_HISTORY_MINUTE_TIME: u16 = 0x0FB4;
 
